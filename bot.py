@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 import sys
-from datetime import datetime
+from datetime import datetime, time
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
@@ -43,13 +43,20 @@ main_loop = None
 # --- UTILS ---
 
 def schedule_reminder_job(app, reminder_data):
-    reminder_time = datetime.strptime(reminder_data['reminder_time'], "%H:%M").time()
+    # Parse time and set timezone
+    user_tz = pytz.timezone(reminder_data['timezone'])
+    h, m = map(int, reminder_data['reminder_time'].split(':'))
+    # Make the time aware of the user's timezone
+    reminder_time = time(hour=h, minute=m, tzinfo=user_tz)
+    
     job_name = str(reminder_data['_id'])
     
+    # Cleanup old job
     current_jobs = app.job_queue.get_jobs_by_name(job_name)
     for job in current_jobs:
         job.schedule_removal()
 
+    # Schedule daily
     app.job_queue.run_daily(
         send_daily_reminder,
         time=reminder_time,
@@ -57,6 +64,7 @@ def schedule_reminder_job(app, reminder_data):
         data=reminder_data,
         name=job_name
     )
+    logger.info(f"Scheduled job {job_name} for {reminder_time} ({reminder_data['timezone']})")
 
 async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -76,14 +84,11 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     else:
         job.schedule_removal()
 
-# --- REMINDER CONVERSATION ---
+# --- HANDLERS ---
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    keyboard = [
-        ["🇺🇿 Tashkent/Uzbekistan"],
-        [KeyboardButton("📍 Not listed? Send Location", request_location=True)]
-    ]
+    keyboard = [["🇺🇿 Tashkent/Uzbekistan"], [KeyboardButton("📍 Share Location", request_location=True)]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("Select timezone or share location:", reply_markup=reply_markup)
     return GET_TZ_CHOICE
@@ -94,10 +99,9 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         timezone_str = tf.timezone_at(lng=loc.longitude, lat=loc.latitude) or "UTC"
     else:
         choice = update.message.text
-        if "Tashkent" in choice:
-            timezone_str = "Asia/Tashkent"
-        else:
-            await update.message.reply_text("Please use buttons or share location.")
+        timezone_str = "Asia/Tashkent" if "Tashkent" in choice else None
+        if not timezone_str:
+            await update.message.reply_text("Please use buttons.")
             return GET_TZ_CHOICE
     
     context.user_data['timezone'] = timezone_str
@@ -136,7 +140,7 @@ async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await reminders_col.insert_one(data)
     data['_id'] = result.inserted_id
     schedule_reminder_job(application, data)
-    await update.message.reply_text(f"✅ Reminder '{label}' set!")
+    await update.message.reply_text(f"✅ Reminder for '{label}' is ACTIVE!")
     return ConversationHandler.END
 
 # --- APP SETUP ---
@@ -146,17 +150,14 @@ def create_application():
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("remind", start_remind)],
         states={
-            GET_TZ_CHOICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice),
-                MessageHandler(filters.LOCATION, handle_tz_choice)
-            ],
+            GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)],
             GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)],
             GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)],
             GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)],
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)],
     )
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Use /remind to start.")))
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Type /remind to begin.")))
     app.add_handler(conv_handler)
     return app
 
@@ -164,7 +165,7 @@ application = create_application()
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
-def index(): return "Running!"
+def index(): return "Bot Engine is ACTIVE and Listening!"
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
@@ -177,6 +178,7 @@ async def main():
     global main_loop
     main_loop = asyncio.get_running_loop()
     
+    # 1. DB Connect
     try:
         await client.admin.command('ismaster')
         logger.info("✅ MongoDB Connected")
@@ -184,12 +186,17 @@ async def main():
         logger.error(f"❌ MongoDB Failed: {e}")
         sys.exit(1)
 
+    # 2. START THE ENGINE (Mandatory for JobQueue)
+    await application.initialize()
+    await application.start() # <-- CRITICAL FIX
+    
+    # 3. Reload reminders
     cursor = reminders_col.find({})
     async for r in cursor: schedule_reminder_job(application, r)
     
-    await application.initialize()
+    # 4. Webhook
     await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-    logger.info(f"✅ Webhook set to {RENDER_URL}/{TOKEN}")
+    logger.info(f"✅ Bot Engine Started & Webhook set.")
     
     from werkzeug.serving import make_server
     import threading
@@ -207,4 +214,3 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"FATAL: {e}")
         sys.exit(1)
-
