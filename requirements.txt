@@ -1,5 +1,5 @@
 python-telegram-bot[job-queue]==21.1
-apscheduler=3.10.4
+apscheduler==3.10.4
 flask==3.0.3
 gunicorn==22.0.0
 pytz
