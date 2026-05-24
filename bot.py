@@ -47,6 +47,10 @@ main_loop = None
 # --- UTILS ---
 
 def schedule_reminder_job(app, reminder_data):
+    if not app.job_queue:
+        logger.error("❌ JobQueue is missing! Make sure python-telegram-bot[job-queue] is installed.")
+        return
+
     user_tz = pytz.timezone(reminder_data['timezone'])
     h, m = map(int, reminder_data['reminder_time'].split(':'))
     reminder_time = time(hour=h, minute=m, tzinfo=user_tz)
@@ -82,11 +86,11 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     else:
         job.schedule_removal()
 
-# --- ADMIN COMMANDS (Invisible) ---
+# --- ADMIN COMMANDS ---
 
 async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        return # Ignore if not admin
+        return
 
     reminders_count = await reminders_col.count_documents({})
     codes_count = await codes_col.count_documents({})
@@ -100,14 +104,13 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        return # Ignore if not admin
+        return
 
     await update.message.reply_text("📦 Preparing data dump from MongoDB...")
     
     cursor = reminders_col.find({})
     reminders = await cursor.to_list(length=1000)
     
-    # Clean data for JSON
     for r in reminders:
         r['_id'] = str(r['_id'])
 
@@ -115,7 +118,10 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(file_path, "w") as f:
         json.dump(reminders, f, indent=4)
     
-    await update.message.reply_document(document=open(file_path, "rb"), filename="reminders_backup.json")
+    # Using 'with open' context block guarantees files are safely closed before deletion
+    with open(file_path, "rb") as backup_file:
+        await update.message.reply_document(document=backup_file, filename="reminders_backup.json")
+        
     os.remove(file_path)
 
 # --- FORWARDER LOGIC ---
@@ -226,8 +232,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "del":
         await reminders_col.delete_one({"_id": ObjectId(r_id)})
-        jobs = application.job_queue.get_jobs_by_name(r_id)
-        for job in jobs: job.schedule_removal()
+        if application.job_queue:
+            jobs = application.job_queue.get_jobs_by_name(r_id)
+            for job in jobs: job.schedule_removal()
         await query.edit_message_text("❌ Reminder deleted.")
     
     elif action == "edit":
@@ -250,20 +257,19 @@ def create_application():
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
     )
     
-    # Explicit commands (Visible in menu)
     app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Commands:\n/remind - Set reminder\n/list - Manage reminders")))
     app.add_handler(CommandHandler("list", list_reminders))
     app.add_handler(CommandHandler("save", save_message))
     
-    # Admin commands (Invisible, only for ADMIN_ID)
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(conv_handler)
     
-    # Forwarder / Text handler
     async def forwarder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message or not update.message.text:
+            return
         text = update.message.text.upper().strip()
         record = await codes_col.find_one({"code": text})
         if record:
@@ -299,25 +305,34 @@ async def main():
     await application.initialize()
     await application.start()
     
+    # Reload active countdowns from db upon startup
     cursor = reminders_col.find({})
-    async for r in cursor: schedule_reminder_job(application, r)
+    async for r in cursor: 
+        schedule_reminder_job(application, r)
     
     await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-    logger.info(f"🚀 Admin Master Ready.")
+    logger.info(f"🚀 Admin Master Ready on port {PORT}.")
     
+    # Safer Async-compliant Web Server Implementation using Werkzeug natively
     from werkzeug.serving import make_server
     import threading
+    
     class ServerThread(threading.Thread):
         def __init__(self, app):
-            threading.Thread.__init__(self)
+            super().__init__()
             self.server = make_server('0.0.0.0', PORT, app)
-        def run(self): self.server.serve_forever()
+            self.daemon = True # Allows thread to safely collapse when main terminates
+        def run(self): 
+            self.server.serve_forever()
     
     ServerThread(flask_app).start()
-    while True: await asyncio.sleep(3600)
+    
+    while True: 
+        await asyncio.sleep(3600)
 
 if __name__ == '__main__':
-    try: asyncio.run(main())
+    try: 
+        asyncio.run(main())
     except Exception as e:
         logger.error(f"FATAL: {e}")
         sys.exit(1)
