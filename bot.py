@@ -36,6 +36,8 @@ client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
 db = client.telegram_bot
 reminders_col = db.reminders
 codes_col = db.saved_codes
+group_keys_col = db.group_keys          # Maps: chat_id -> unique secret key
+unlocked_groups_col = db.unlocked_users  # Maps: user_id -> list of unlocked chat_ids
 tf = TimezoneFinder()
 
 # Conversation States
@@ -94,11 +96,13 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reminders_count = await reminders_col.count_documents({})
     codes_count = await codes_col.count_documents({})
+    keys_count = await group_keys_col.count_documents({})
     
     msg = (
         "📊 **Master Statistics**\n\n"
         f"👥 Active Reminders: {reminders_count}\n"
-        f"🔑 Saved Forwarder Codes: {codes_count}\n"
+        f"🔑 Indexed Storage Codes: {codes_count}\n"
+        f"🔐 Password Secured Groups: {keys_count}\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -107,7 +111,6 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text("📦 Preparing data dump from MongoDB...")
-    
     cursor = reminders_col.find({})
     reminders = await cursor.to_list(length=1000)
     
@@ -118,38 +121,41 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(file_path, "w") as f:
         json.dump(reminders, f, indent=4)
     
-    # Using 'with open' context block guarantees files are safely closed before deletion
     with open(file_path, "rb") as backup_file:
         await update.message.reply_document(document=backup_file, filename="reminders_backup.json")
         
     os.remove(file_path)
 
-# --- FORWARDER LOGIC ---
+# --- 🔐 SECURITY KEY MANAGEMENT COMMANDS ---
 
-async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message or not context.args:
-        await update.message.reply_text("❌ Reply to a message with: /save CODE")
-        return
-    code = context.args[0].upper()
-    await codes_col.update_one(
-        {"code": code}, 
-        {"$set": {"code": code, "chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, 
-        upsert=True
-    )
-    await update.message.reply_text(f"✅ Code '{code}' saved to Cloud!")
-
-
-# --- BULK REGISTERING LOGIC --- 
-
-async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Security check: Only you can run this
+async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run this INSIDE a database group to set its specific password. Format: /setkey PASSWORD"""
     if update.effective_user.id != ADMIN_ID:
         return
 
-    # Expecting format: /autobulk START_ID END_ID PREFIX
-    # Example: /autobulk 45 120 AAA
+    if not context.args:
+        await update.message.reply_text("❌ Use format: `/setkey YOUR_PASSWORD`", parse_mode="Markdown")
+        return
+
+    secret_key = context.args[0].strip()
+    chat_id = update.effective_chat.id
+
+    await group_keys_col.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"chat_id": chat_id, "secret_key": secret_key}},
+        upsert=True
+    )
+    await update.message.reply_text(f"🔒 Custom security password set successfully for this storage group partition!")
+
+# --- 🔄 AUTOMATED BULK INDEXER ---
+
+async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run this INSIDE a database group to index files. Format: /autobulk START_ID END_ID PREFIX"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
     if len(context.args) < 3:
-        await update.message.reply_text("❌ Use format: /autobulk START_ID END_ID PREFIX\nExample: /autobulk 45 120 AAA", parse_mode="Markdown")
+        await update.message.reply_text("❌ Use format: `/autobulk START_ID END_ID PREFIX`\nExample: `/autobulk 45 120 AAA`", parse_mode="Markdown")
         return
 
     try:
@@ -157,27 +163,18 @@ async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE)
         end_id = int(context.args[1])
         prefix = context.args[2].upper().strip()
     except ValueError:
-        await update.message.reply_text("❌ Start and End IDs must be numbers.")
+        await update.message.reply_text("❌ Start and End positions must be numerical digits.")
         return
 
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🔄 Starting bulk registration for messages {start_id} to {end_id} with prefix '{prefix}'...")
+    await update.message.reply_text(f"🔄 Compiling row indexing map from message {start_id} to {end_id} under sequence prefix '{prefix}'...")
 
     success_count = 0
     current_code_number = 1
 
-    # Loop through the range of message IDs
     for msg_id in range(start_id, end_id + 1):
         try:
-            # Tell the bot to look at this specific message ID in the group
-            # We use copy_message to a dummy location or just look at the message object if accessible,
-            # but python-telegram-bot allows us to try and forward/copy it to verify if it exists.
-            # To check safely without spamming, we see if we can read or interact with it.
-            
-            # Formulate your template code (e.g., AAA001, AAA002)
-            code = f"{prefix}{current_code_number:03d}"  # :03d makes it 3 digits (001, 002)
-            
-            # Save it to MongoDB
+            code = f"{prefix}{current_code_number:03d}"
             await codes_col.update_one(
                 {"code": code}, 
                 {"$set": {
@@ -189,16 +186,26 @@ async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             success_count += 1
             current_code_number += 1
-            
-            # Small pause to prevent hitting Telegram rate limits
-            await asyncio.sleep(0.1)
-            
+            await asyncio.sleep(0.05) 
         except Exception as e:
-            # If a message ID is empty (deleted text or event notification), skip it
-            logger.warning(f"Skipping message ID {msg_id}: {e}")
+            logger.warning(f"Skipping empty row index slot {msg_id}: {e}")
             continue
 
-    await update.message.reply_text(f"✅ Bulk registration complete!\nTotal files indexed: {success_count}\nCodes range: {prefix}001 to {prefix}{success_count:03d}")
+    await update.message.reply_text(f"✅ Matrix build finalized! Indexed {success_count} assets.\nRange sequence: {prefix}001 to {prefix}{success_count:03d}")
+
+# --- MANUAL SAVE LOGIC ---
+
+async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message or not context.args:
+        await update.message.reply_text("❌ Reply to an asset item with: /save UNIQUE_CODE")
+        return
+    code = context.args[0].upper().strip()
+    await codes_col.update_one(
+        {"code": code}, 
+        {"$set": {"code": code, "chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, 
+        upsert=True
+    )
+    await update.message.reply_text(f"✅ Mapping coordinates for '{code}' successfully written to index!")
 
 # --- REMINDER CONVERSATION ---
 
@@ -268,7 +275,7 @@ async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_reminder_job(application, data)
     return ConversationHandler.END
 
-# --- LIST / EDIT / DELETE ---
+# --- LIST / EDIT / DELETE REMINDERS ---
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -303,6 +310,65 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['edit_id'] = r_id
         await query.edit_message_text("✏️ Editing enabled. Type /remind to update.")
 
+# --- CORE DATA PROCESSING ENGINE & ROUTING HANDLER ---
+
+async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    text_upper = text.upper()
+    is_admin = (user_id == ADMIN_ID)
+
+    # State tracking: Check if the user is currently stuck trying to unlock a specific storage group
+    pending_group_unlock = context.user_data.get('pending_unlock_group_id')
+
+    if pending_group_unlock and not is_admin:
+        # User is trying to submit a secret key password for a specific group
+        key_record = await group_keys_col.find_one({"chat_id": pending_group_unlock})
+        if key_record and text == key_record["secret_key"]:
+            # Successful unlock! Save their authorization profile array to MongoDB
+            await unlocked_groups_col.update_one(
+                {"user_id": user_id},
+                {"$addToSet": {"unlocked_chats": pending_group_unlock}},
+                upsert=True
+            )
+            del context.user_data['pending_unlock_group_id']
+            await update.message.reply_text("🔓 Authentication verified! Group repository node decrypted. Please retype your asset file code request.")
+        else:
+            await update.message.reply_text("🔒 Invalid Key credentials. Access Denied. Provide the correct matching authorization key:")
+        return
+
+    # Process file code lookups
+    record = await codes_col.find_one({"code": text_upper})
+    if record:
+        target_group_chat_id = record["chat_id"]
+        
+        # Security Verification Check
+        if not is_admin:
+            # Does this specific file group require a key password map pointer?
+            security_gate = await group_keys_col.find_one({"chat_id": target_group_chat_id})
+            if security_gate:
+                # Has this user already unlocked access session status for this chat_id?
+                user_auth_profile = await unlocked_groups_col.find_one({"user_id": user_id})
+                if not user_auth_profile or target_group_chat_id not in user_auth_profile.get("unlocked_chats", []):
+                    # Flag their session state waiting for this specific key
+                    context.user_data['pending_unlock_group_id'] = target_group_chat_id
+                    await update.message.reply_text(f"🔒 Encrypted Data Block. This asset collection group is locked. Please enter the specific SECRET_KEY password to open access:")
+                    return
+
+        # Execution Sequence: Replicate storage file using clean copy protocols
+        try:
+            await context.bot.copy_message(
+                chat_id=update.effective_chat.id,
+                from_chat_id=target_group_chat_id,
+                message_id=record["message_id"]
+            )
+        except Exception as e:
+            logger.error(f"Copy sequence execution error: {e}")
+            await update.message.reply_text("⚠️ System proxy error: Unable to clone target package from storage pool nodes.")
+
 # --- APP SETUP ---
 
 def create_application():
@@ -319,32 +385,30 @@ def create_application():
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
     )
     
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Commands:\n/remind - Set reminder\n/list - Manage reminders")))
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("🛠️ Cloud Database Nodes Status: ONLINE.\n\nEnter valid catalog storage keys to decrypt and pull assets.")))
     app.add_handler(CommandHandler("list", list_reminders))
-    app.add_handler(CommandHandler("save", save_message))
     
+    # Storage Group Internal Configuration Commands
+    app.add_handler(CommandHandler("save", save_message))
+    app.add_handler(CommandHandler("autobulk", auto_bulk_register))
+    app.add_handler(CommandHandler("setkey", set_group_key))
+    
+    # System Admin Operations
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
     
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(conv_handler)
     
-    async def forwarder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message or not update.message.text:
-            return
-        text = update.message.text.upper().strip()
-        record = await codes_col.find_one({"code": text})
-        if record:
-            await context.bot.forward_message(chat_id=update.effective_chat.id, from_chat_id=record["chat_id"], message_id=record["message_id"])
-    
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forwarder))
+    # Core processing pipeline catch-all
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
     return app
 
 application = create_application()
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
-def index(): return "Master Admin Bot is LIVE!"
+def index(): return "Master Storage Engine Live Cluster Online."
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
@@ -359,23 +423,21 @@ async def main():
     
     try:
         await client.admin.command('ismaster')
-        logger.info("✅ MongoDB Connected")
+        logger.info("✅ MongoDB Cluster Linked")
     except Exception as e:
-        logger.error(f"❌ MongoDB Failed: {e}")
+        logger.error(f"❌ MongoDB initialization error: {e}")
         sys.exit(1)
 
     await application.initialize()
     await application.start()
     
-    # Reload active countdowns from db upon startup
     cursor = reminders_col.find({})
     async for r in cursor: 
         schedule_reminder_job(application, r)
     
     await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-    logger.info(f"🚀 Admin Master Ready on port {PORT}.")
+    logger.info(f"🚀 Microservice Worker Matrix operational on cluster node port {PORT}.")
     
-    # Safer Async-compliant Web Server Implementation using Werkzeug natively
     from werkzeug.serving import make_server
     import threading
     
@@ -383,7 +445,7 @@ async def main():
         def __init__(self, app):
             super().__init__()
             self.server = make_server('0.0.0.0', PORT, app)
-            self.daemon = True # Allows thread to safely collapse when main terminates
+            self.daemon = True
         def run(self): 
             self.server.serve_forever()
     
@@ -396,5 +458,5 @@ if __name__ == '__main__':
     try: 
         asyncio.run(main())
     except Exception as e:
-        logger.error(f"FATAL: {e}")
+        logger.error(f"FATAL SYSTEM EXIT: {e}")
         sys.exit(1)
