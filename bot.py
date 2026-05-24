@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import sys
+import json
 from datetime import datetime, time
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 MONGO_URI = os.getenv("MONGO_URI")
+ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
 PORT = int(os.getenv("PORT", 8080))
 
 # Initialize MongoDB & Timezone Finder
@@ -51,7 +53,6 @@ def schedule_reminder_job(app, reminder_data):
     
     job_name = str(reminder_data['_id'])
     
-    # Remove existing job if it exists (for edits)
     current_jobs = app.job_queue.get_jobs_by_name(job_name)
     for job in current_jobs:
         job.schedule_removal()
@@ -81,6 +82,42 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     else:
         job.schedule_removal()
 
+# --- ADMIN COMMANDS (Invisible) ---
+
+async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return # Ignore if not admin
+
+    reminders_count = await reminders_col.count_documents({})
+    codes_count = await codes_col.count_documents({})
+    
+    msg = (
+        "📊 **Master Statistics**\n\n"
+        f"👥 Active Reminders: {reminders_count}\n"
+        f"🔑 Saved Forwarder Codes: {codes_count}\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return # Ignore if not admin
+
+    await update.message.reply_text("📦 Preparing data dump from MongoDB...")
+    
+    cursor = reminders_col.find({})
+    reminders = await cursor.to_list(length=1000)
+    
+    # Clean data for JSON
+    for r in reminders:
+        r['_id'] = str(r['_id'])
+
+    file_path = "database_dump.json"
+    with open(file_path, "w") as f:
+        json.dump(reminders, f, indent=4)
+    
+    await update.message.reply_document(document=open(file_path, "rb"), filename="reminders_backup.json")
+    os.remove(file_path)
+
 # --- FORWARDER LOGIC ---
 
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -93,12 +130,11 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"$set": {"code": code, "chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, 
         upsert=True
     )
-    await update.message.reply_text(f"✅ Code '{code}' saved to Database!")
+    await update.message.reply_text(f"✅ Code '{code}' saved to Cloud!")
 
 # --- REMINDER CONVERSATION ---
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # We DON'T clear user_data here because we might have an 'edit_id'
     keyboard = [["🇺🇿 Tashkent/Uzbekistan"], [KeyboardButton("📍 Share Location", request_location=True)]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("Step 1: Select timezone or share location:", reply_markup=reply_markup)
@@ -142,7 +178,6 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = update.message.text
     user_id = update.effective_user.id
-    
     data = {
         "user_id": user_id,
         "timezone": context.user_data['timezone'],
@@ -151,12 +186,11 @@ async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "label": label
     }
 
-    # Check if we are updating an existing one
     edit_id = context.user_data.get('edit_id')
     if edit_id:
         await reminders_col.update_one({"_id": ObjectId(edit_id)}, {"$set": data})
         data['_id'] = ObjectId(edit_id)
-        await update.message.reply_text(f"✅ Reminder '{label}' updated!")
+        await update.message.reply_text(f"✅ Reminder updated!")
         context.user_data.clear()
     else:
         result = await reminders_col.insert_one(data)
@@ -174,7 +208,7 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = await cursor.to_list(length=10)
     
     if not reminders:
-        await update.message.reply_text("You have no active reminders. Use /remind to create one.")
+        await update.message.reply_text("No active reminders.")
         return
 
     for r in reminders:
@@ -194,21 +228,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reminders_col.delete_one({"_id": ObjectId(r_id)})
         jobs = application.job_queue.get_jobs_by_name(r_id)
         for job in jobs: job.schedule_removal()
-        await query.edit_message_text("❌ Reminder deleted from Database.")
+        await query.edit_message_text("❌ Reminder deleted.")
     
     elif action == "edit":
         context.user_data['edit_id'] = r_id
-        await query.edit_message_text("✏️ Editing mode enabled. Type /remind to update the details.")
-
-# --- TEXT HANDLING ---
-
-async def handle_text_and_forwarder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.upper().strip()
-    record = await codes_col.find_one({"code": text})
-    if record:
-        await context.bot.forward_message(chat_id=update.effective_chat.id, from_chat_id=record["chat_id"], message_id=record["message_id"])
-    else:
-        await update.message.reply_text(f"Echo: {update.message.text}\n(Hint: No forwarder code matched)")
+        await query.edit_message_text("✏️ Editing enabled. Type /remind to update.")
 
 # --- APP SETUP ---
 
@@ -226,19 +250,33 @@ def create_application():
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
     )
     
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Commands:\n/remind - Set reminder\n/list - Manage reminders\n/save CODE - Save message (Admin)")))
+    # Explicit commands (Visible in menu)
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Commands:\n/remind - Set reminder\n/list - Manage reminders")))
     app.add_handler(CommandHandler("list", list_reminders))
     app.add_handler(CommandHandler("save", save_message))
+    
+    # Admin commands (Invisible, only for ADMIN_ID)
+    app.add_handler(CommandHandler("stats", get_stats))
+    app.add_handler(CommandHandler("export", export_data))
+    
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_and_forwarder))
+    
+    # Forwarder / Text handler
+    async def forwarder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.upper().strip()
+        record = await codes_col.find_one({"code": text})
+        if record:
+            await context.bot.forward_message(chat_id=update.effective_chat.id, from_chat_id=record["chat_id"], message_id=record["message_id"])
+    
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, forwarder))
     return app
 
 application = create_application()
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
-def index(): return "Master Ultimate Bot is LIVE!"
+def index(): return "Master Admin Bot is LIVE!"
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
@@ -261,12 +299,11 @@ async def main():
     await application.initialize()
     await application.start()
     
-    # Reload existing reminders
     cursor = reminders_col.find({})
     async for r in cursor: schedule_reminder_job(application, r)
     
     await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-    logger.info(f"🚀 Master Ultimate Bot Ready.")
+    logger.info(f"🚀 Admin Master Ready.")
     
     from werkzeug.serving import make_server
     import threading
