@@ -138,6 +138,68 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(f"✅ Code '{code}' saved to Cloud!")
 
+
+# --- BULK REGISTERING LOGIC --- 
+
+async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Security check: Only you can run this
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    # Expecting format: /autobulk START_ID END_ID PREFIX
+    # Example: /autobulk 45 120 AAA
+    if len(context.args) < 3:
+        await update.message.reply_text("❌ Use format: /autobulk START_ID END_ID PREFIX\nExample: /autobulk 45 120 AAA", parse_mode="Markdown")
+        return
+
+    try:
+        start_id = int(context.args[0])
+        end_id = int(context.args[1])
+        prefix = context.args[2].upper().strip()
+    except ValueError:
+        await update.message.reply_text("❌ Start and End IDs must be numbers.")
+        return
+
+    chat_id = update.effective_chat.id
+    await update.message.reply_text(f"🔄 Starting bulk registration for messages {start_id} to {end_id} with prefix '{prefix}'...")
+
+    success_count = 0
+    current_code_number = 1
+
+    # Loop through the range of message IDs
+    for msg_id in range(start_id, end_id + 1):
+        try:
+            # Tell the bot to look at this specific message ID in the group
+            # We use copy_message to a dummy location or just look at the message object if accessible,
+            # but python-telegram-bot allows us to try and forward/copy it to verify if it exists.
+            # To check safely without spamming, we see if we can read or interact with it.
+            
+            # Formulate your template code (e.g., AAA001, AAA002)
+            code = f"{prefix}{current_code_number:03d}"  # :03d makes it 3 digits (001, 002)
+            
+            # Save it to MongoDB
+            await codes_col.update_one(
+                {"code": code}, 
+                {"$set": {
+                    "code": code, 
+                    "chat_id": chat_id, 
+                    "message_id": msg_id
+                }}, 
+                upsert=True
+            )
+            success_count += 1
+            current_code_number += 1
+            
+            # Small pause to prevent hitting Telegram rate limits
+            await asyncio.sleep(0.1)
+            
+        except Exception as e:
+            # If a message ID is empty (deleted text or event notification), skip it
+            logger.warning(f"Skipping message ID {msg_id}: {e}")
+            continue
+
+    await update.message.reply_text(f"✅ Bulk registration complete!\nTotal files indexed: {success_count}\nCodes range: {prefix}001 to {prefix}{success_count:03d}")
+
 # --- REMINDER CONVERSATION ---
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
