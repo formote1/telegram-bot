@@ -4,15 +4,14 @@ import asyncio
 import sys
 from datetime import datetime
 import pytz
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder, 
     ContextTypes, 
     CommandHandler, 
     MessageHandler, 
     filters, 
-    ConversationHandler,
-    CallbackQueryHandler
+    ConversationHandler
 )
 from flask import Flask, request
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -37,6 +36,9 @@ tf = TimezoneFinder()
 
 # Conversation States
 GET_TZ_CHOICE, GET_DATE, GET_TIME, GET_LABEL = range(4)
+
+# Global loop variable
+main_loop = None
 
 # --- UTILS ---
 
@@ -78,81 +80,69 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    
-    # Simplified keyboard
     keyboard = [
         ["🇺🇿 Tashkent/Uzbekistan"],
         [KeyboardButton("📍 Not listed? Send Location", request_location=True)]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    
-    await update.message.reply_text(
-        "Select your timezone or share your location for precision:",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text("Select timezone or share location:", reply_markup=reply_markup)
     return GET_TZ_CHOICE
 
 async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.location:
         loc = update.message.location
         timezone_str = tf.timezone_at(lng=loc.longitude, lat=loc.latitude) or "UTC"
-        logger.info(f"Detected timezone via location: {timezone_str}")
     else:
         choice = update.message.text
         if "Tashkent" in choice:
             timezone_str = "Asia/Tashkent"
         else:
-            await update.message.reply_text("Please use the buttons provided or share your location.")
+            await update.message.reply_text("Please use buttons or share location.")
             return GET_TZ_CHOICE
     
     context.user_data['timezone'] = timezone_str
-    await update.message.reply_text(f"✅ Timezone set to: {timezone_str}\nNow, enter the target date (YYYY-MM-DD):")
+    await update.message.reply_text(f"✅ Timezone: {timezone_str}\nTarget date (YYYY-MM-DD):")
     return GET_DATE
 
 async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(update.message.text, "%Y-%m-%d")
         context.user_data['target_date'] = update.message.text
-        await update.message.reply_text("⏰ At what time daily? (HH:MM):")
+        await update.message.reply_text("⏰ Daily time (HH:MM):")
         return GET_TIME
     except ValueError:
-        await update.message.reply_text("❌ Invalid format. Use YYYY-MM-DD (e.g., 2026-05-30).")
+        await update.message.reply_text("❌ Use YYYY-MM-DD.")
         return GET_DATE
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(update.message.text, "%H:%M")
         context.user_data['reminder_time'] = update.message.text
-        await update.message.reply_text("🏷️ Label for this reminder:")
+        await update.message.reply_text("🏷️ Label:")
         return GET_LABEL
     except ValueError:
-        await update.message.reply_text("❌ Invalid format. Use HH:MM (e.g., 09:00).")
+        await update.message.reply_text("❌ Use HH:MM.")
         return GET_TIME
 
 async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = update.message.text
-    user_id = update.effective_user.id
-    
     data = {
-        "user_id": user_id,
+        "user_id": update.effective_user.id,
         "timezone": context.user_data['timezone'],
         "target_date": context.user_data['target_date'],
         "reminder_time": context.user_data['reminder_time'],
         "label": label
     }
-
     result = await reminders_col.insert_one(data)
     data['_id'] = result.inserted_id
-    
     schedule_reminder_job(application, data)
-    await update.message.reply_text(f"✅ Reminder for '{label}' set successfully!")
+    await update.message.reply_text(f"✅ Reminder '{label}' set!")
     return ConversationHandler.END
 
 # --- APP SETUP ---
 
 def create_application():
     app = ApplicationBuilder().token(TOKEN).build()
-    
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("remind", start_remind)],
         states={
@@ -166,8 +156,7 @@ def create_application():
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)],
     )
-    
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Type /remind to set a daily countdown!")))
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("Use /remind to start.")))
     app.add_handler(conv_handler)
     return app
 
@@ -179,11 +168,15 @@ def index(): return "Running!"
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
-    data = request.get_json(force=True)
-    asyncio.run_coroutine_threadsafe(application.process_update(Update.de_json(data, application.bot)), asyncio.get_running_loop())
+    if main_loop:
+        data = request.get_json(force=True)
+        asyncio.run_coroutine_threadsafe(application.process_update(Update.de_json(data, application.bot)), main_loop)
     return "OK"
 
 async def main():
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    
     try:
         await client.admin.command('ismaster')
         logger.info("✅ MongoDB Connected")
@@ -196,6 +189,7 @@ async def main():
     
     await application.initialize()
     await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
+    logger.info(f"✅ Webhook set to {RENDER_URL}/{TOKEN}")
     
     from werkzeug.serving import make_server
     import threading
@@ -213,3 +207,4 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"FATAL: {e}")
         sys.exit(1)
+
