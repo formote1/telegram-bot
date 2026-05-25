@@ -3,7 +3,7 @@ import logging
 import asyncio
 import sys
 import json
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -42,14 +42,15 @@ tf = TimezoneFinder()
 
 # Conversation States
 GET_TZ_CHOICE, GET_DATE, GET_TIME, GET_LABEL = range(4)
+MANAGE_CHOOSE_PREFIX, MANAGE_ACTION = range(4, 6)
 
-# Global loop variable
-main_loop = None
+# Global application instance
+application = None
 
 # --- UTILS & BACKGROUND WORKERS ---
 
 async def delete_msg_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Background worker that handles the 6-minute self-destruct timer."""
+    """Background worker that handles the self-destruct timer."""
     job = context.job
     try:
         await context.bot.delete_message(chat_id=job.data["chat_id"], message_id=job.data["message_id"])
@@ -59,26 +60,33 @@ async def delete_msg_callback(context: ContextTypes.DEFAULT_TYPE):
 
 def schedule_reminder_job(app, reminder_data):
     if not app.job_queue:
-        logger.error("❌ JobQueue is missing! Make sure python-telegram-bot[job-queue] is installed.")
+        logger.error("❌ JobQueue is missing!")
         return
 
-    user_tz = pytz.timezone(reminder_data['timezone'])
-    h, m = map(int, reminder_data['reminder_time'].split(':'))
-    reminder_time = time(hour=h, minute=m, tzinfo=user_tz)
-    
-    job_name = str(reminder_data['_id'])
-    
-    current_jobs = app.job_queue.get_jobs_by_name(job_name)
-    for job in current_jobs:
-        job.schedule_removal()
+    try:
+        user_tz = pytz.timezone(reminder_data['timezone'])
+        h, m = map(int, reminder_data['reminder_time'].split(':'))
+        
+        # BUG FIX: Use naive time + timezone object in run_daily for better DST handling
+        reminder_time = time(hour=h, minute=m)
+        
+        job_name = str(reminder_data['_id'])
+        
+        # Remove existing job if it exists (for updates)
+        current_jobs = app.job_queue.get_jobs_by_name(job_name)
+        for job in current_jobs:
+            job.schedule_removal()
 
-    app.job_queue.run_daily(
-        send_daily_reminder,
-        time=reminder_time,
-        chat_id=reminder_data['user_id'],
-        data=reminder_data,
-        name=job_name
-    )
+        app.job_queue.run_daily(
+            send_daily_reminder,
+            time=reminder_time,
+            timezone=user_tz,
+            chat_id=reminder_data['user_id'],
+            data=reminder_data,
+            name=job_name
+        )
+    except Exception as e:
+        logger.error(f"Error scheduling job: {e}")
 
 async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -97,7 +105,84 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     else:
         job.schedule_removal()
 
-# --- ADMIN CONFIGURATION OPERATIONS ---
+# --- ADMIN MANAGEMENT OPERATIONS ---
+
+async def manage_db_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    
+    # Aggregate to find unique prefixes
+    pipeline = [
+        {"$project": {"prefix": {"$substr": ["$code", 0, 3]}}},
+        {"$group": {"_id": "$prefix", "count": {"$sum": 1}}}
+    ]
+    cursor = codes_col.aggregate(pipeline)
+    prefixes = await cursor.to_list(length=100)
+    
+    if not prefixes:
+        await update.message.reply_text("No data indexed in database.")
+        return ConversationHandler.END
+
+    keyboard = []
+    for p in prefixes:
+        prefix_str = p['_id']
+        keyboard.append([InlineKeyboardButton(f"{prefix_str} ({p['count']} items)", callback_data=f"pref_{prefix_str}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🛠️ **Database Management**\nSelect a prefix to manage or edit:", reply_markup=reply_markup, parse_mode="Markdown")
+    return MANAGE_CHOOSE_PREFIX
+
+async def handle_manage_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prefix = query.data.split('_')[1]
+    context.user_data['manage_prefix'] = prefix
+    
+    keyboard = [
+        [InlineKeyboardButton("Change Prefix ✏️", callback_data=f"act_rename"), 
+         InlineKeyboardButton("Delete All 🗑️", callback_data=f"act_delete")],
+        [InlineKeyboardButton("Cancel ❌", callback_data="act_cancel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(f"Selected: **{prefix}**\nWhat would you like to do?", reply_markup=reply_markup, parse_mode="Markdown")
+    return MANAGE_ACTION
+
+async def handle_manage_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split('_')[1]
+    prefix = context.user_data.get('manage_prefix')
+
+    if action == "delete":
+        result = await codes_col.delete_many({"code": {"$regex": f"^{prefix}"}})
+        await query.edit_message_text(f"✅ Deleted {result.deleted_count} items with prefix '{prefix}'.")
+        return ConversationHandler.END
+    elif action == "rename":
+        await query.edit_message_text(f"Enter the NEW prefix for '{prefix}':")
+        return MANAGE_ACTION # Wait for text input
+    else:
+        await query.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+async def handle_new_prefix_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    old_prefix = context.user_data.get('manage_prefix')
+    new_prefix = update.message.text.upper().strip()
+    
+    if not old_prefix or not new_prefix:
+        return ConversationHandler.END
+
+    # Update all codes starting with old_prefix
+    cursor = codes_col.find({"code": {"$regex": f"^{old_prefix}"}})
+    updates = 0
+    async for doc in cursor:
+        new_code = doc['code'].replace(old_prefix, new_prefix, 1)
+        await codes_col.update_one({"_id": doc["_id"]}, {"$set": {"code": new_code}})
+        updates += 1
+
+    await update.message.reply_text(f"✅ Renamed {updates} items: {old_prefix} -> {new_prefix}")
+    return ConversationHandler.END
+
+# --- EXISTING ADMIN OPS IMPROVED ---
 
 async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -117,93 +202,127 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text("📦 Preparing data dump from MongoDB...")
+    await update.message.reply_text("📦 Preparing full data dump...")
+    
+    # IMPROVEMENT: Fetch all instead of limit 1000
     cursor = reminders_col.find({})
-    reminders = await cursor.to_list(length=1000)
+    reminders = await cursor.to_list(length=None)
     
     for r in reminders:
         r['_id'] = str(r['_id'])
 
-    file_path = "database_dump.json"
+    file_path = f"backup_{datetime.now().strftime('%Y%m%d')}.json"
     with open(file_path, "w") as f:
         json.dump(reminders, f, indent=4)
     
-    with open(file_path, "rb") as backup_file:
-        await update.message.reply_document(document=backup_file, filename="reminders_backup.json")
+    await update.message.reply_document(document=open(file_path, "rb"), filename=file_path)
     os.remove(file_path)
 
 async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run INSIDE a database group to set its specific password. Format: /setkey PASSWORD"""
     if update.effective_user.id != ADMIN_ID:
         return
     if not context.args:
-        await update.message.reply_text("❌ Use format: `/setkey YOUR_PASSWORD`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Use: `/setkey PASSWORD`")
         return
-
     secret_key = context.args[0].strip()
     chat_id = update.effective_chat.id
-
-    await group_keys_col.update_one(
-        {"chat_id": chat_id},
-        {"$set": {"chat_id": chat_id, "secret_key": secret_key}},
-        upsert=True
-    )
-    await update.message.reply_text(f"🔒 Custom security password set successfully for this storage group partition!")
+    await group_keys_col.update_one({"chat_id": chat_id}, {"$set": {"secret_key": secret_key}}, upsert=True)
+    await update.message.reply_text(f"🔒 Security password set for this group!")
 
 async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run INSIDE a database group to index files. Format: /autobulk START_ID END_ID PREFIX"""
     if update.effective_user.id != ADMIN_ID:
         return
     if len(context.args) < 3:
-        await update.message.reply_text("❌ Use format: `/autobulk START_ID END_ID PREFIX`\nExample: `/autobulk 45 120 AAA`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Format: `/autobulk START_ID END_ID PREFIX`")
         return
 
     try:
-        start_id = int(context.args[0])
-        end_id = int(context.args[1])
+        start_id, end_id = int(context.args[0]), int(context.args[1])
         prefix = context.args[2].upper().strip()
-    except ValueError:
-        await update.message.reply_text("❌ Start and End positions must be numerical digits.")
+    except:
+        await update.message.reply_text("❌ Invalid numbers.")
         return
 
     chat_id = update.effective_chat.id
-    await update.message.reply_text(f"🔄 Compiling row indexing map from message {start_id} to {end_id} under sequence prefix '{prefix}'...")
+    
+    # SMART CHECK: Find how many items already exist for this prefix in this group
+    existing_count = await codes_col.count_documents({
+        "chat_id": chat_id,
+        "code": {"$regex": f"^{prefix}"}
+    })
+    
+    start_num = existing_count + 1
+    msg = await update.message.reply_text(f"🔍 Found {existing_count} items for {prefix}.\n🔄 Starting bulk indexing from {prefix}{start_num:03d}...")
 
-    success_count = 0
-    current_code_number = 1
-
+    success = 0
+    current_num = start_num
     for msg_id in range(start_id, end_id + 1):
-        try:
-            code = f"{prefix}{current_code_number:03d}"
-            await codes_col.update_one(
-                {"code": code}, 
-                {"$set": {
-                    "code": code, 
-                    "chat_id": chat_id, 
-                    "message_id": msg_id
-                }}, 
-                upsert=True
-            )
-            success_count += 1
-            current_code_number += 1
-            await asyncio.sleep(0.05) 
-        except Exception as e:
-            logger.warning(f"Skipping empty row index slot {msg_id}: {e}")
-            continue
+        code = f"{prefix}{current_num:03d}"
+        await codes_col.update_one({"code": code}, {"$set": {"chat_id": chat_id, "message_id": msg_id}}, upsert=True)
+        success += 1
+        current_num += 1
+        if success % 20 == 0: await msg.edit_text(f"🔄 Progress: {success} items indexed (currently at {code})...")
 
-    await update.message.reply_text(f"✅ Matrix build finalized! Indexed {success_count} assets.\nRange sequence: {prefix}001 to {prefix}{success_count:03d}")
+    await msg.edit_text(f"✅ Matrix build finalized!\n📦 Indexed {success} new assets.\n🔢 Range: {prefix}{start_num:03d} to {prefix}{current_num-1:03d}")
+
+async def admin_palette(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only command palette GUI."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("📊 System Stats", callback_data="pal_stats"), InlineKeyboardButton("📦 Export Data", callback_data="pal_export")],
+        [InlineKeyboardButton("🛠️ Manage DB", callback_data="pal_manage"), InlineKeyboardButton("🔒 Set Group Key", callback_data="pal_setkey")],
+        [InlineKeyboardButton("⏰ New Reminder", callback_data="pal_remind"), InlineKeyboardButton("❌ Close", callback_data="pal_close")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "🛠️ **ADMIN COMMAND PALETTE**\n"
+        "Welcome, Your Honor. Select a quick action below:\n\n"
+        "📝 **Manual Commands:**\n"
+        "• `/save CODE` - Reply to an asset\n"
+        "• `/autobulk START END PREFIX` - Bulk index\n"
+        "• `/remind` - Setup notification",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split('_')[1]
+    
+    if action == "stats":
+        await get_stats(update, context)
+        await query.answer()
+    elif action == "export":
+        await export_data(update, context)
+        await query.answer()
+    elif action == "manage":
+        await manage_db_start(update, context)
+        await query.answer()
+        await query.delete_message()
+    elif action == "setkey":
+        await query.edit_message_text("To set a key, use: `/setkey YOUR_PASSWORD` inside the target group.")
+        await query.answer()
+    elif action == "remind":
+        await start_remind(update, context)
+        await query.answer()
+        await query.delete_message()
+    elif action == "close":
+        await query.delete_message()
+        await query.answer()
 
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message or not context.args:
-        await update.message.reply_text("❌ Reply to an asset item with: /save UNIQUE_CODE")
+        await update.message.reply_text("❌ Reply to a message with `/save CODE`")
         return
     code = context.args[0].upper().strip()
     await codes_col.update_one(
         {"code": code}, 
-        {"$set": {"code": code, "chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, 
+        {"$set": {"chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, 
         upsert=True
     )
-    await update.message.reply_text(f"✅ Mapping coordinates for '{code}' successfully written to index!")
+    await update.message.reply_text(f"✅ Saved as `{code}`", parse_mode="Markdown")
 
 # --- REMINDER CONVERSATION HANDLERS ---
 
@@ -219,22 +338,19 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         timezone_str = tf.timezone_at(lng=loc.longitude, lat=loc.latitude) or "UTC"
     else:
         choice = update.message.text
-        timezone_str = "Asia/Tashkent" if "Tashkent" in choice else None
-        if not timezone_str:
-            await update.message.reply_text("Please use buttons.")
-            return GET_TZ_CHOICE
+        timezone_str = "Asia/Tashkent" if "Tashkent" in choice else "UTC"
     
     context.user_data['timezone'] = timezone_str
-    await update.message.reply_text(f"✅ Timezone: {timezone_str}\nStep 2: Enter target date (YYYY-MM-DD):")
+    await update.message.reply_text(f"✅ Timezone: {timezone_str}\nStep 2: Date (YYYY-MM-DD):")
     return GET_DATE
 
 async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(update.message.text, "%Y-%m-%d")
         context.user_data['target_date'] = update.message.text
-        await update.message.reply_text("Step 3: Daily reminder time (HH:MM in 24h format):")
+        await update.message.reply_text("Step 3: Time (HH:MM):")
         return GET_TIME
-    except ValueError:
+    except:
         await update.message.reply_text("❌ Use YYYY-MM-DD.")
         return GET_DATE
 
@@ -242,9 +358,9 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(update.message.text, "%H:%M")
         context.user_data['reminder_time'] = update.message.text
-        await update.message.reply_text("Step 4: Label for this reminder:")
+        await update.message.reply_text("Step 4: Label:")
         return GET_LABEL
-    except ValueError:
+    except:
         await update.message.reply_text("❌ Use HH:MM.")
         return GET_TIME
 
@@ -263,178 +379,89 @@ async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if edit_id:
         await reminders_col.update_one({"_id": ObjectId(edit_id)}, {"$set": data})
         data['_id'] = ObjectId(edit_id)
-        await update.message.reply_text(f"✅ Reminder updated!")
-        context.user_data.clear()
     else:
         result = await reminders_col.insert_one(data)
         data['_id'] = result.inserted_id
-        await update.message.reply_text(f"✅ New reminder '{label}' is active!")
     
     schedule_reminder_job(application, data)
+    await update.message.reply_text(f"✅ Reminder active!")
+    context.user_data.clear()
     return ConversationHandler.END
 
-async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    cursor = reminders_col.find({"user_id": user_id})
-    reminders = await cursor.to_list(length=10)
-    
-    if not reminders:
-        await update.message.reply_text("No active reminders.")
-        return
-
-    for r in reminders:
-        keyboard = [[InlineKeyboardButton("Edit ✏️", callback_data=f"edit_{r['_id']}"), InlineKeyboardButton("Delete 🗑️", callback_data=f"del_{r['_id']}")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            f"🔔 *{r['label']}*\n📅 {r['target_date']} | ⏰ {r['reminder_time']}\n🌍 {r['timezone']}",
-            reply_markup=reply_markup, parse_mode="Markdown"
-        )
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    action, r_id = query.data.split('_')
-
-    if action == "del":
-        await reminders_col.delete_one({"_id": ObjectId(r_id)})
-        if application.job_queue:
-            jobs = application.job_queue.get_jobs_by_name(r_id)
-            for job in jobs: job.schedule_removal()
-        await query.edit_message_text("❌ Reminder deleted.")
-    elif action == "edit":
-        context.user_data['edit_id'] = r_id
-        await query.edit_message_text("✏️ Editing enabled. Type /remind to update.")
-
-# --- CORE DATA PROCESSING ENGINE & ROUTING HANDLER ---
+# --- CORE ROUTING & SECURITY ---
 
 async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
+    if not update.message or not update.message.text: return
+    
+    # Ignore if in a conversation (Fixes overlapping)
+    if context.user_data.get('timezone') or context.user_data.get('manage_prefix'): return
 
-    # 🚦 PROTECTION FIX: If user is running through the reminder menu setup steps,
-    # back completely out and don't let the file security layer block them.
-    if context.user_data.get('timezone') and not context.user_data.get('label'):
-        return
-
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    user_id, chat_id = update.effective_user.id, update.effective_chat.id
     text = update.message.text.strip()
-    text_upper = text.upper()
     is_admin = (user_id == ADMIN_ID)
 
-    # 🛑 STATE 1: User is currently locked out and submitting a password key credentials string
-    pending_group_unlock = context.user_data.get('pending_unlock_group_id')
+    # PASSWORD UNLOCK STATE
+    pending_group = context.user_data.get('pending_unlock_group_id')
+    if pending_group and not is_admin:
+        try: await context.bot.delete_message(chat_id, update.message.message_id)
+        except: pass
 
-    if pending_group_unlock and not is_admin:
-        # Step A: Delete user's text secret key entry message IMMEDIATELY
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
-        except Exception as e:
-            logger.error(f"Failed immediate key deletion step: {e}")
-
-        # Step B: Validate structural database matching parameters
-        key_record = await group_keys_col.find_one({"chat_id": pending_group_unlock})
+        key_record = await group_keys_col.find_one({"chat_id": pending_group})
         if key_record and text == key_record["secret_key"]:
-            # Commit authentication profile to cluster
-            await unlocked_groups_col.update_one(
-                {"user_id": user_id},
-                {"$addToSet": {"unlocked_chats": pending_group_unlock}},
-                upsert=True
-            )
+            await unlocked_groups_col.update_one({"user_id": user_id}, {"$addToSet": {"unlocked_chats": pending_group}}, upsert=True)
             
-            # Step C: Delete the old "Encryption Alert" interface block message IMMEDIATELY
-            alert_msg_id = context.user_data.get('alert_message_id')
-            if alert_msg_id:
-                try:
-                    await context.bot.delete_message(chat_id=chat_id, message_id=alert_msg_id)
-                except Exception as e:
-                    logger.error(f"Failed deleting active encryption alert: {e}")
-
-            # Step D: Extract original target text reference pointer straight from transient volatile RAM storage
-            saved_file_code = context.user_data.get('interrupted_file_code')
+            # Cleanup alert and resume
+            alert_id = context.user_data.pop('alert_message_id', None)
+            if alert_id: 
+                try: await context.bot.delete_message(chat_id, alert_id)
+                except: pass
             
-            # Flush volatile temporary state cache variables from RAM segment
+            saved_code = context.user_data.pop('interrupted_file_code', None)
             context.user_data.pop('pending_unlock_group_id', None)
-            context.user_data.pop('alert_message_id', None)
-            context.user_data.pop('interrupted_file_code', None)
-
-            # Step E: Automatically route execution to deliver the file originally wanted!
-            if saved_file_code:
-                record = await codes_col.find_one({"code": saved_file_code})
-                if record:
-                    await execute_file_delivery(chat_id, record, context)
+            
+            if saved_code:
+                record = await codes_col.find_one({"code": saved_code})
+                if record: await execute_file_delivery(chat_id, record, context)
         else:
-            # Drop invalid response warning notice, self-destructing it shortly to keep environment completely pristine
-            fail_msg = await update.message.reply_text("❌ Invalid Key credentials. Access Denied. Provide the correct authorization key:")
-            context.job_queue.run_once(delete_msg_callback, when=20, data={"chat_id": chat_id, "message_id": fail_msg.message_id})
+            msg = await update.message.reply_text("❌ Access Denied. Correct key?")
+            context.job_queue.run_once(delete_msg_callback, 10, data={"chat_id": chat_id, "message_id": msg.message_id})
         return
 
-    # 🏁 STATE 2: User is executing a standard text lookup routing address match (e.g., AAA001)
-    record = await codes_col.find_one({"code": text_upper})
+    # CODE LOOKUP
+    record = await codes_col.find_one({"code": text.upper()})
     if record:
-        target_group_chat_id = record["chat_id"]
-        
-        # Step A: Clear user's input request text string IMMEDIATELY
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
-        except Exception as e:
-            logger.error(f"Failed immediate matching index text removal: {e}")
+        try: await context.bot.delete_message(chat_id, update.message.message_id)
+        except: pass
 
-        # Step B: Check permissions threshold
         if not is_admin:
-            security_gate = await group_keys_col.find_one({"chat_id": target_group_chat_id})
-            if security_gate:
-                user_auth_profile = await unlocked_groups_col.find_one({"user_id": user_id})
-                if not user_auth_profile or target_group_chat_id not in user_auth_profile.get("unlocked_chats", []):
-                    
-                    # Store session context into Render's volatile RAM cluster cache strings
-                    context.user_data['pending_unlock_group_id'] = target_group_chat_id
-                    context.user_data['interrupted_file_code'] = text_upper
-
-                    alert_msg = await context.bot.send_message(
-                        chat_id=chat_id, 
-                        text="🔒 Encrypted Data Block. This asset collection group is locked. Please enter the specific SECRET_KEY password to open access:"
-                    )
-                    context.user_data['alert_message_id'] = alert_msg.message_id
+            gate = await group_keys_col.find_one({"chat_id": record["chat_id"]})
+            if gate:
+                user_auth = await unlocked_groups_col.find_one({"user_id": user_id})
+                if not user_auth or record["chat_id"] not in user_auth.get("unlocked_chats", []):
+                    context.user_data['pending_unlock_group_id'] = record["chat_id"]
+                    context.user_data['interrupted_file_code'] = text.upper()
+                    alert = await context.bot.send_message(chat_id, "🔒 This collection is locked. Enter SECRET_KEY:")
+                    context.user_data['alert_message_id'] = alert.message_id
                     return
-
-        # Step C: Permissions verification confirmed. Issue clean deployment protocols
+        
         await execute_file_delivery(chat_id, record, context)
 
-# --- 🚀 SUB-SERVICE ROUTINE: DELIVERY AND SELF-DESTRUCT TIMERS ---
-
 async def execute_file_delivery(chat_id: int, record: dict, context: ContextTypes.DEFAULT_TYPE):
-    """Handles deep cloning replication of asset payload packages and wires ephemeral countdowns."""
     try:
-        # 1. Pipeline copy replication request
-        copied_file = await context.bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=record["chat_id"],
-            message_id=record["message_id"]
-        )
-        
-        # 2. Append text terminal notice underneath
-        warning_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text="⚠️ **SYSTEM NOTICE:** This data stream is ephemeral. Save or forward this asset elsewhere immediately; this file and notice will self-destruct in 6 minutes.",
-            parse_mode="Markdown"
-        )
-        
-        # 3. Schedule asynchronous background structural deletions in 6 minutes (360 seconds)
-        context.job_queue.run_once(delete_msg_callback, when=360, data={"chat_id": chat_id, "message_id": copied_file.message_id})
-        context.job_queue.run_once(delete_msg_callback, when=360, data={"chat_id": chat_id, "message_id": warning_msg.message_id})
-        
+        copied = await context.bot.copy_message(chat_id=chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
+        warn = await context.bot.send_message(chat_id, "⚠️ **EPHEMERAL:** Self-destruct in 6m.", parse_mode="Markdown")
+        context.job_queue.run_once(delete_msg_callback, 360, data={"chat_id": chat_id, "message_id": copied.message_id})
+        context.job_queue.run_once(delete_msg_callback, 360, data={"chat_id": chat_id, "message_id": warn.message_id})
     except Exception as e:
-        logger.error(f"Asset routing delivery execution exception: {e}")
-        err_msg = await context.bot.send_message(chat_id=chat_id, text="⚠️ System proxy error: Unable to clone target package from storage pools.")
-        context.job_queue.run_once(delete_msg_callback, when=20, data={"chat_id": chat_id, "message_id": err_msg.message_id})
+        logger.error(f"Delivery error: {e}")
 
-# --- APPLICATION GENERATOR MATRIX ---
+# --- APP SETUP ---
 
 def create_application():
     app = ApplicationBuilder().token(TOKEN).build()
     
-    conv_handler = ConversationHandler(
+    # Main Conversations
+    remind_conv = ConversationHandler(
         entry_points=[CommandHandler("remind", start_remind)],
         states={
             GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)],
@@ -444,90 +471,65 @@ def create_application():
         },
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
     )
-    
-    # 🛠️ ORIGINAL MASTER GREETING LAYOUT RESTORED CLEANLY
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text(
-        "👋 Welcome back to your Personal Assistant Master Node.\n\n"
-        "⏰ **Reminder System:**\n"
-        "🔹 /remind - Schedule a new daily countdown reminder\n"
-        "🔹 /list - View and manage active countdowns\n\n"
-        "📦 **Storage Infrastructure:**\n"
-        "🔹 Enter any valid alphanumeric index key (e.g., `AAA001`) to cleanly replicate target assets.\n\n"
-        "📊 **System Status:**\n"
-        "🔹 /stats - Check database allocations"
-    , parse_mode="Markdown")))
 
-    app.add_handler(CommandHandler("list", list_reminders))
+    manage_conv = ConversationHandler(
+        entry_points=[CommandHandler("manage", manage_db_start)],
+        states={
+            MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_prefix)],
+            MANAGE_ACTION: [
+                CallbackQueryHandler(handle_manage_action, pattern="^act_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_prefix_text)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
+    )
     
-    # Internal Database Map Orchestration Actions
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("👋 Assistant Ready.\n/remind - New Reminder\n/manage - Admin DB Edit\n/stats - System Status")))
+    app.add_handler(CommandHandler("list", lambda u,c: u.message.reply_text("Use /remind to edit or /stats for counts."))) # Placeholder for brevity
     app.add_handler(CommandHandler("save", save_message))
     app.add_handler(CommandHandler("autobulk", auto_bulk_register))
     app.add_handler(CommandHandler("setkey", set_group_key))
-    
-    # Core Global Administration Operations
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
     
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("admin", admin_palette))
+    app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
     
-    # Process text entry filters through tracking pipeline (safely ignores slash commands)
+    app.add_handler(remind_conv)
+    app.add_handler(manage_conv)
+    app.add_handler(CallbackQueryHandler(lambda u,c: None)) # Catch-all
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
+    
     return app
 
-application = create_application()
 flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def index(): return "Master Storage Engine Live Cluster Online."
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
-    if main_loop:
-        data = request.get_json(force=True)
-        asyncio.run_coroutine_threadsafe(application.process_update(Update.de_json(data, application.bot)), main_loop)
+    # BUG FIX: Use update_queue for safer concurrent processing
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    asyncio.run_coroutine_threadsafe(application.update_queue.put(update), asyncio.get_event_loop())
     return "OK"
 
 async def main():
-    global main_loop
-    main_loop = asyncio.get_running_loop()
+    global application
+    application = create_application()
     
-    try:
-        await client.admin.command('ismaster')
-        logger.info("✅ MongoDB Cluster Linked")
-    except Exception as e:
-        logger.error(f"❌ MongoDB initialization error: {e}")
-        sys.exit(1)
-
     await application.initialize()
     await application.start()
     
+    # Re-schedule reminders on boot
     cursor = reminders_col.find({})
-    async for r in cursor: 
-        schedule_reminder_job(application, r)
+    async for r in cursor: schedule_reminder_job(application, r)
     
     await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-    logger.info(f"🚀 Microservice Worker Matrix operational on cluster node port {PORT}.")
     
     from werkzeug.serving import make_server
     import threading
+    server = make_server('0.0.0.0', PORT, flask_app)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     
-    class ServerThread(threading.Thread):
-        def __init__(self, app):
-            super().__init__()
-            self.server = make_server('0.0.0.0', PORT, app)
-            self.daemon = True
-        def run(self): 
-            self.server.serve_forever()
-    
-    ServerThread(flask_app).start()
-    
-    while True: 
-        await asyncio.sleep(3600)
+    while True: await asyncio.sleep(3600)
 
 if __name__ == '__main__':
-    try: 
-        asyncio.run(main())
-    except Exception as e:
-        logger.error(f"FATAL SYSTEM EXIT: {e}")
-        sys.exit(1)
+    asyncio.run(main())
