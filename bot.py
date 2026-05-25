@@ -43,6 +43,7 @@ tf = TimezoneFinder()
 
 # Conversation States
 GET_TZ_CHOICE, GET_DATE, GET_TIME, GET_LABEL = range(4)
+MANAGE_CHOOSE_PREFIX, MANAGE_ACTION = range(4, 6)
 
 # Global application and loop instances
 application = None
@@ -108,8 +109,28 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 # --- MASTER CONSOLE OPERATIONS ---
 
+async def range_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Surgical range delete: /del PREFIX START END (e.g., /del AAA 3 10)"""
+    if update.effective_user.id != ADMIN_ID: return
+    if len(context.args) < 3:
+        await update.message.reply_text("❌ **Format:** `/del PREFIX START END`\nExample: `/del AAA 3 10` deletes AAA003 to AAA010.", parse_mode="Markdown")
+        return
+    
+    try:
+        prefix = context.args[0].upper().strip()
+        start = int(context.args[1])
+        end = int(context.args[2])
+        
+        target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+        result = await codes_col.delete_many({"code": {"$in": target_codes}})
+        
+        await update.message.reply_text(f"🗑️ **Surgical Strike Complete**\nSuccessfully vaporized `{result.deleted_count}` items from `{target_codes[0]}` to `{target_codes[-1]}`.", parse_mode="Markdown")
+        await log_event(ADMIN_ID, "ADMIN", f"Range Delete: {prefix}{start:03d}-{end:03d} ({result.deleted_count} items)")
+    except Exception as e:
+        await update.message.reply_text(f"❌ **Error:** {e}")
+
 async def get_key_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates the live Key/Prefix matrix report."""
+    """Live report of chat prefixes, counts, and their secret keys."""
     pipeline = [
         {"$project": {"prefix": {"$substr": ["$code", 0, 3]}, "chat_id": 1}},
         {"$group": {"_id": {"prefix": "$prefix", "chat_id": "$chat_id"}, "count": {"$sum": 1}}}
@@ -121,7 +142,7 @@ async def get_key_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("🗝️ No indexed groups found.")
         return
 
-    report_lines = ["🗝️ **Live Secret Key Matrix**\n"]
+    report_lines = ["🗝️ **LIVE SECRET KEY MATRIX**\n"]
     for r in results:
         prefix = r['_id']['prefix']
         chat_id = r['_id']['chat_id']
@@ -130,12 +151,12 @@ async def get_key_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key_record = await group_keys_col.find_one({"chat_id": chat_id})
         passkey = key_record["secret_key"] if key_record else "NO KEY SET"
         
-        report_lines.append(f"• `{prefix}` - {count} items => `{passkey}`")
+        report_lines.append(f"• `{prefix}` - {count:02d} items  =>  `{passkey}`")
 
     await update.effective_message.reply_text("\n".join(report_lines), parse_mode="Markdown")
 
 async def get_all_lists(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View all reminders from all users."""
+    """View every single reminder in the entire system."""
     cursor = reminders_col.find({}).sort("user_id", 1)
     reminders = await cursor.to_list(length=50)
     
@@ -143,7 +164,7 @@ async def get_all_lists(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("📜 No active reminders in system.")
         return
 
-    report = ["📜 **Global Reminder Audit**\n"]
+    report = ["📜 **GLOBAL REMINDER AUDIT**\n"]
     for r in reminders:
         report.append(f"👤 `{r['user_id']}`: {r['label']} ({r['target_date']})")
     
@@ -158,26 +179,69 @@ async def get_system_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("📋 Logs are currently empty.")
         return
 
-    report = ["📋 **System Activity Logs** (Last 15 events)\n"]
+    report = ["📋 **SYSTEM ACTIVITY LOGS** (Last 15 events)\n"]
     for l in logs:
         time_str = l['timestamp'].strftime("%H:%M:%S")
         report.append(f"`[{time_str}]` {l['username']}: {l['action']}")
     
     await update.effective_message.reply_text("\n".join(report), parse_mode="Markdown")
 
+async def manage_db_gui(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """GUI to delete entire prefixes."""
+    pipeline = [{"$project": {"prefix": {"$substr": ["$code", 0, 3]}}}, {"$group": {"_id": "$prefix", "count": {"$sum": 1}}}]
+    cursor = codes_col.aggregate(pipeline)
+    prefixes = await cursor.to_list(length=100)
+    
+    if not prefixes:
+        await update.effective_message.reply_text("Database empty.")
+        return
+
+    keyboard = []
+    for p in prefixes:
+        keyboard.append([InlineKeyboardButton(f"Wipe {p['_id']} ({p['count']} items)", callback_data=f"pref_wipe_{p['_id']}")])
+    
+    await update.effective_message.reply_text("🗑️ **Select Prefix to WIPE ENTIRELY:**", reply_markup=InlineKeyboardMarkup(keyboard))
+    return MANAGE_CHOOSE_PREFIX
+
+async def handle_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    prefix = query.data.split('_')[2]
+    
+    await codes_col.delete_many({"code": {"$regex": f"^{prefix}"}})
+    await query.edit_message_text(f"🔥 **NUKE COMPLETE:** All items under `{prefix}` have been vaporized.", parse_mode="Markdown")
+    await log_event(ADMIN_ID, "ADMIN", f"Full Wipe: {prefix}")
+    return ConversationHandler.END
+
 async def admin_palette_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The Master Console Dashboard listing ALL commands."""
     keyboard = [
-        [InlineKeyboardButton("📊 Stats", callback_data="pal_stats"), InlineKeyboardButton("📦 Export", callback_data="pal_export")],
+        [InlineKeyboardButton("📊 System Stats", callback_data="pal_stats"), InlineKeyboardButton("📦 Export Data", callback_data="pal_export")],
         [InlineKeyboardButton("📜 All Reminders", callback_data="pal_alllists"), InlineKeyboardButton("🗝️ Key Matrix", callback_data="pal_keys")],
-        [InlineKeyboardButton("📋 System Logs", callback_data="pal_logs")]
+        [InlineKeyboardButton("🗑️ Manage DB", callback_data="pal_manage"), InlineKeyboardButton("📋 System Logs", callback_data="pal_logs")]
     ]
+    
     text = (
-        "👑 **MASTER CONSOLE**\n"
-        "Status: Online & Monitoring\n\n"
-        "🛠️ **Command Reference:**\n"
-        "• `/save CODE` - Index reply\n"
-        "• `/autobulk START END PREFIX` - Mass Index\n"
-        "• `/setkey PASS` - Lock current group"
+        "👑 **MASTER CONSOLE: SUPREME COMMANDER**\n"
+        "───────────────────────\n"
+        "**System Status:** 🟢 Operational\n"
+        "───────────────────────\n"
+        "📜 **COMPLETE COMMAND LIST:**\n\n"
+        "**Core Commands:**\n"
+        "• `/start` - Launch node / Admin Dashboard\n"
+        "• `/remind` - Setup new countdown reminder\n"
+        "• `/list` - View your personal reminders\n\n"
+        "**Database Matrix:**\n"
+        "• `/save CODE` - Index message (by reply)\n"
+        "• `/autobulk START END PREFIX` - Mass index\n"
+        "• `/del PREFIX START END` - Surgical range delete\n"
+        "• `/setkey PASSWORD` - Secure group partition\n\n"
+        "**Monitoring:**\n"
+        "• `/stats` - Live system audit report\n"
+        "• `/export` - Full database JSON backup\n"
+        "• `/admin` - Re-trigger this Master Console\n"
+        "───────────────────────\n"
+        "Select a monitoring tool below:"
     )
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -190,27 +254,39 @@ async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_
     elif action == "alllists": await get_all_lists(update, context)
     elif action == "keys": await get_key_matrix(update, context)
     elif action == "logs": await get_system_logs(update, context)
+    elif action == "manage": 
+        await manage_db_gui(update, context)
+        await query.delete_message()
     
     await query.answer()
 
 async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Polished Stats Formatting."""
     r_c = await reminders_col.count_documents({})
     c_c = await codes_col.count_documents({})
     l_c = await logs_col.count_documents({})
-    await update.effective_message.reply_text(f"📊 **Stats:**\nReminders: {r_c}\nIndexed: {c_c}\nStored Logs: {l_c}")
+    k_c = await group_keys_col.count_documents({})
+    
+    stats_msg = (
+        "📊 **SYSTEM AUDIT REPORT**\n"
+        "───────────────────\n"
+        f"📅 **Total Reminders:**   `{r_c:03d}`\n"
+        f"🔑 **Indexed Assets:**   `{c_c:03d}`\n"
+        f"🔐 **Locked Groups:**    `{k_c:03d}`\n"
+        f"📋 **Stored Logs:**      `{l_c:03d}`\n"
+        "───────────────────\n"
+        "*Auto-cleaning active: Logs purge every 7 days.*"
+    )
+    await update.effective_message.reply_text(stats_msg, parse_mode="Markdown")
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor = reminders_col.find({})
     data = await cursor.to_list(length=None)
     for r in data: r['_id'] = str(r['_id'])
-    with open("backup.json", "w") as f: json.dump(data, f, indent=4)
-    await update.effective_message.reply_document(document=open("backup.json", "rb"))
-    os.remove("backup.json")
-
-async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or not context.args: return
-    await group_keys_col.update_one({"chat_id": update.effective_chat.id}, {"$set": {"secret_key": context.args[0].strip()}}, upsert=True)
-    await update.message.reply_text("🔒 Group security key updated!")
+    file_path = f"backup_{datetime.now().strftime('%Y%m%d')}.json"
+    with open(file_path, "w") as f: json.dump(data, f, indent=4)
+    await update.effective_message.reply_document(document=open(file_path, "rb"), filename=file_path)
+    os.remove(file_path)
 
 async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or len(context.args) < 3: return
@@ -218,20 +294,20 @@ async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE)
         start_id, end_id, prefix = int(context.args[0]), int(context.args[1]), context.args[2].upper().strip()
         exist = await codes_col.count_documents({"chat_id": update.effective_chat.id, "code": {"$regex": f"^{prefix}"}})
         curr = exist + 1
-        msg = await update.message.reply_text(f"🔄 Indexing {prefix} from {curr:03d}...")
+        msg = await update.message.reply_text(f"🔄 **Indexing {prefix} from {curr:03d}...**", parse_mode="Markdown")
         for m_id in range(start_id, end_id + 1):
             await codes_col.update_one({"code": f"{prefix}{curr:03d}"}, {"$set": {"chat_id": update.effective_chat.id, "message_id": m_id}}, upsert=True)
             curr += 1
-        await msg.edit_text(f"✅ Indexed up to {prefix}{curr-1:03d}")
+        await msg.edit_text(f"✅ **Build Finalized!** Indexed up to `{prefix}{curr-1:03d}`", parse_mode="Markdown")
     except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
 
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message or not context.args: return
     code = context.args[0].upper().strip()
     await codes_col.update_one({"code": code}, {"$set": {"chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, upsert=True)
-    await update.message.reply_text(f"✅ Saved as `{code}`")
+    await update.message.reply_text(f"✅ Saved as `{code}`", parse_mode="Markdown")
 
-# --- REMINDERS CORE ---
+# --- REMINDERS ---
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -280,7 +356,7 @@ async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data['_id'] = res.inserted_id
     schedule_reminder_job(application, data)
     await log_event(user.id, user.username, f"Set reminder: {data['label']}")
-    await update.message.reply_text("✅ Reminder active!")
+    await update.message.reply_text("✅ New reminder is active!")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -292,7 +368,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admin_palette_msg(update, context)
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set daily countdown\n📜 `/list` - Manage reminders\n📦 Enter an asset code (e.g. `AAA001`) to retrieve data."
+        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Enter an asset code (e.g. `AAA001`) to retrieve data."
         await update.message.reply_text(greet, parse_mode="Markdown")
 
 # --- ROUTING ---
@@ -362,21 +438,32 @@ def create_application():
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
         per_message=False
     )
+    man_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(manage_db_gui, pattern="^pal_manage$")],
+        states={MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_callback, pattern="^pref_wipe_")]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
+        per_message=False
+    )
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("admin", start_command))
     app.add_handler(CommandHandler("list", list_reminders))
+    app.add_handler(CommandHandler("del", range_delete))
     app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
     app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern="^delrem_"))
     app.add_handler(CommandHandler("save", save_message))
     app.add_handler(CommandHandler("autobulk", auto_bulk_register))
     app.add_handler(CommandHandler("setkey", set_group_key))
+    app.add_handler(CommandHandler("stats", get_stats))
+    app.add_handler(CommandHandler("export", export_data))
     app.add_handler(rem_conv)
+    app.add_handler(man_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
     return app
 
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
-def health(): return "Cluster v6 Online."
+def health(): return "Supreme Commander Node Online."
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
@@ -388,10 +475,7 @@ def webhook():
 async def main():
     global application, main_loop
     main_loop = asyncio.get_running_loop()
-    
-    # SETUP TTL INDEX FOR LOGS (7 Days = 604800 seconds)
     await logs_col.create_index("timestamp", expireAfterSeconds=604800)
-    
     application = create_application()
     await application.initialize()
     await application.start()
