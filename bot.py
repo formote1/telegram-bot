@@ -29,23 +29,11 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
 MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_ID = int(os.getenv("ADMIN_USER_ID", 0))
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", 10000))
 
-# Initialize MongoDB & Timezone Finder
-client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-db = client.telegram_bot
-reminders_col = db.reminders
-codes_col = db.saved_codes
-group_keys_col = db.group_keys          # Maps: chat_id -> unique secret key
-unlocked_groups_col = db.unlocked_users  # Maps: user_id -> list of unlocked chat_ids
-tf = TimezoneFinder()
-
-# Conversation States
-GET_TZ_CHOICE, GET_DATE, GET_TIME, GET_LABEL = range(4)
-MANAGE_CHOOSE_PREFIX, MANAGE_ACTION = range(4, 6)
-
-# Global application instance
+# Global application and loop instances
 application = None
+main_loop = None
 
 # --- UTILS & BACKGROUND WORKERS ---
 
@@ -502,17 +490,19 @@ def create_application():
     
     return app
 
-flask_app = Flask(__name__)
+@flask_app.route('/')
+def health(): return "Master Storage Engine Live Cluster Online."
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
-    # BUG FIX: Use update_queue for safer concurrent processing
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run_coroutine_threadsafe(application.update_queue.put(update), asyncio.get_event_loop())
+    if main_loop:
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        main_loop.call_soon_threadsafe(application.update_queue.put_nowait, update)
     return "OK"
 
 async def main():
-    global application
+    global application, main_loop
+    main_loop = asyncio.get_running_loop()
     application = create_application()
     
     await application.initialize()
