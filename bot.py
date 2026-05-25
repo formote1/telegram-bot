@@ -127,9 +127,9 @@ async def admin_palette_msg():
         [InlineKeyboardButton("🗑️ Manage DB", callback_data="pal_manage"), InlineKeyboardButton("📋 System Logs", callback_data="pal_logs")]
     ]
     text = (
-        "👑 **MASTER CONSOLE: SUPREME COMMANDER**\n"
+        "👑 **MASTER CONSOLE** 🔞\n"
         "───────────────────────\n"
-        "**System Status:** 🟢 Operational\n"
+        "**System Status:** 🌐 Operational\n"
         "───────────────────────\n"
         "📜 **COMPLETE COMMAND LIST:**\n\n"
         "**Core Commands:**\n"
@@ -339,7 +339,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Enter an asset code (e.g. `AAA001`) to retrieve data."
+        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Enter an asset code (e.g. `AAA001`) to retrieve data.\n\nCopyright © NurAziz"
         await update.message.reply_text(greet, parse_mode="Markdown")
 
 async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
