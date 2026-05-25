@@ -311,6 +311,11 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.message or not update.message.text:
         return
 
+    # 🚦 PROTECTION FIX: If user is running through the reminder menu setup steps,
+    # back completely out and don't let the file security layer block them.
+    if context.user_data.get('timezone') and not context.user_data.get('label'):
+        return
+
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
@@ -440,7 +445,18 @@ def create_application():
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
     )
     
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("🛠️ Cloud Database Nodes Status: ONLINE.\n\nEnter valid catalog storage keys to decrypt and pull assets.")))
+    # 🛠️ ORIGINAL MASTER GREETING LAYOUT RESTORED CLEANLY
+    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text(
+        "👋 Welcome back to your Personal Assistant Master Node.\n\n"
+        "⏰ **Reminder System:**\n"
+        "🔹 /remind - Schedule a new daily countdown reminder\n"
+        "🔹 /list - View and manage active countdowns\n\n"
+        "📦 **Storage Infrastructure:**\n"
+        "🔹 Enter any valid alphanumeric index key (e.g., `AAA001`) to cleanly replicate target assets.\n\n"
+        "📊 **System Status:**\n"
+        "🔹 /stats - Check database allocations"
+    , parse_mode="Markdown")))
+
     app.add_handler(CommandHandler("list", list_reminders))
     
     # Internal Database Map Orchestration Actions
@@ -455,7 +471,7 @@ def create_application():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(conv_handler)
     
-    # Process text entry filters through tracking pipeline
+    # Process text entry filters through tracking pipeline (safely ignores slash commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
     return app
 
@@ -515,47 +531,3 @@ if __name__ == '__main__':
     except Exception as e:
         logger.error(f"FATAL SYSTEM EXIT: {e}")
         sys.exit(1)
-
-def create_application():
-    app = ApplicationBuilder().token(TOKEN).build()
-    
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("remind", start_remind)],
-        states={
-            GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)],
-            GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)],
-            GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)],
-            GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
-    )
-    
-    # 🛠️ ORIGINAL GREETING RESTORED: Displays all your command shortcuts cleanly
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text(
-        "👋 Welcome back to your Personal Assistant Master Node.\n\n"
-        "⏰ **Reminder System:**\n"
-        "🔹 /remind - Schedule a new daily countdown reminder\n"
-        "🔹 /list - View and manage active countdowns\n\n"
-        "📦 **Storage Infrastructure:**\n"
-        "🔹 Enter any valid alphanumeric index key (e.g., `AAA001`) to cleanly replicate target assets.\n\n"
-        "📊 **System Status:**\n"
-        "🔹 /stats - Check database allocations"
-    , parse_mode="Markdown")))
-    
-    app.add_handler(CommandHandler("list", list_reminders))
-    
-    # Internal Database Map Orchestration Actions
-    app.add_handler(CommandHandler("save", save_message))
-    app.add_handler(CommandHandler("autobulk", auto_bulk_register))
-    app.add_handler(CommandHandler("setkey", set_group_key))
-    
-    # Core Global Administration Operations
-    app.add_handler(CommandHandler("stats", get_stats))
-    app.add_handler(CommandHandler("export", export_data))
-    
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(conv_handler)
-    
-    # Process text entry filters through tracking pipeline (ignores explicit slash commands)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
-    return app
