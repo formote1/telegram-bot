@@ -62,7 +62,11 @@ def schedule_reminder_job(app, reminder_data):
     try:
         user_tz = pytz.timezone(reminder_data['timezone'])
         h, m = map(int, reminder_data['reminder_time'].split(':'))
-        reminder_time = time(hour=h, minute=m)
+        
+        # FIXED: Correct way to handle timezone in PTB 21.1 JobQueue
+        # Create a time object with the user's timezone attached
+        reminder_time = time(hour=h, minute=m, tzinfo=user_tz)
+        
         job_name = str(reminder_data['_id'])
         current_jobs = app.job_queue.get_jobs_by_name(job_name)
         for job in current_jobs: job.schedule_removal()
@@ -70,7 +74,6 @@ def schedule_reminder_job(app, reminder_data):
         app.job_queue.run_daily(
             send_daily_reminder,
             time=reminder_time,
-            timezone=user_tz,
             chat_id=reminder_data['user_id'],
             data=reminder_data,
             name=job_name
@@ -146,7 +149,6 @@ async def handle_new_prefix_text(update: Update, context: ContextTypes.DEFAULT_T
 # --- ADMIN OPS ---
 
 async def admin_palette_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates the Admin Palette text and keyboard."""
     keyboard = [
         [InlineKeyboardButton("📊 Stats", callback_data="pal_stats"), InlineKeyboardButton("📦 Export", callback_data="pal_export")],
         [InlineKeyboardButton("🛠️ Manage", callback_data="pal_manage"), InlineKeyboardButton("🔒 Key", callback_data="pal_setkey")],
@@ -350,20 +352,33 @@ async def execute_file_delivery(chat_id, record, context):
 
 def create_application():
     app = ApplicationBuilder().token(TOKEN).build()
+    
+    # FIXED: Added per_message=True to fix CallbackQueryHandler tracking warning
     rem_conv = ConversationHandler(
         entry_points=[CommandHandler("remind", start_remind)],
-        states={GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)], GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)], GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]},
+        states={
+            GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)],
+            GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)],
+            GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)],
+            GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]
+        },
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
+        per_message=True
     )
+    
     man_conv = ConversationHandler(
         entry_points=[CommandHandler("manage", manage_db_start)],
-        states={MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_prefix)], MANAGE_ACTION: [CallbackQueryHandler(handle_manage_action, pattern="^act_"), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_prefix_text)]},
+        states={
+            MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_prefix)],
+            MANAGE_ACTION: [CallbackQueryHandler(handle_manage_action, pattern="^act_"), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_prefix_text)]
+        },
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
+        per_message=True
     )
     
     # Handlers
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("admin", lambda u,c: start_command(u,c))) # Manual trigger
+    app.add_handler(CommandHandler("admin", lambda u,c: start_command(u,c)))
     app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
     
     app.add_handler(CommandHandler("save", save_message))
@@ -395,8 +410,11 @@ async def main():
     application = create_application()
     await application.initialize()
     await application.start()
+    
+    # Re-schedule reminders on boot
     cursor = reminders_col.find({})
     async for r in cursor: schedule_reminder_job(application, r)
+    
     await application.bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
     from werkzeug.serving import make_server
     import threading
