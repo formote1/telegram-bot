@@ -432,7 +432,7 @@ async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%Y-%m-%d")
         context.user_data['target_date'] = text
-        await update.message.reply_text("Step 3: Enter time (HH:MM) - e.g., 09:00:")
+        await update.message.reply_text("Step 3: Enter the time you want to be notified\n(HH:MM) 24hour format")
         return GET_TIME
     except ValueError:
         await update.message.reply_text("❌ Invalid date format. Please use YYYY-MM-DD:")
