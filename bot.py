@@ -530,7 +530,7 @@ async def execute_file_delivery(chat_id, record, context, user):
     try:
         copied = await context.bot.copy_message(chat_id=chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
         await log_event(user.id, user.username, f"Requested asset: {record['code']}")
-        warn = await context.bot.send_message(chat_id, "⚠️ **EPHEMERAL:** **ALERT**\nCopy the file somewhere safe\n Self-destruct in 3 minutes.", parse_mode="Markdown")
+        warn = await context.bot.send_message(chat_id, "⚠️ **ALERT**:FILE IS EPHEMERAL\nCopy the file somewhere safe\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
         context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": copied.message_id})
         context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
     except Exception as e: logger.error(f"Delivery error: {e}")
