@@ -145,10 +145,24 @@ async def handle_new_prefix_text(update: Update, context: ContextTypes.DEFAULT_T
 
 # --- ADMIN OPS ---
 
-async def admin_palette(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    keyboard = [[InlineKeyboardButton("📊 Stats", callback_data="pal_stats"), InlineKeyboardButton("📦 Export", callback_data="pal_export")], [InlineKeyboardButton("🛠️ Manage", callback_data="pal_manage"), InlineKeyboardButton("🔒 Key", callback_data="pal_setkey")], [InlineKeyboardButton("❌ Close", callback_data="pal_close")]]
-    await update.message.reply_text("🛠️ **ADMIN PALETTE**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+async def admin_palette_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generates the Admin Palette text and keyboard."""
+    keyboard = [
+        [InlineKeyboardButton("📊 Stats", callback_data="pal_stats"), InlineKeyboardButton("📦 Export", callback_data="pal_export")],
+        [InlineKeyboardButton("🛠️ Manage", callback_data="pal_manage"), InlineKeyboardButton("🔒 Key", callback_data="pal_setkey")],
+        [InlineKeyboardButton("⏰ New Reminder", callback_data="pal_remind"), InlineKeyboardButton("❌ Close", callback_data="pal_close")]
+    ]
+    text = (
+        "👑 **MASTER ADMIN DASHBOARD**\n\n"
+        "Welcome, Your Honor. The system is fully operational.\n\n"
+        "🛠️ **Quick Management:**\n"
+        "• Use buttons below for database & system control.\n\n"
+        "📝 **Manual Commands:**\n"
+        "• `/save CODE` - Reply to an asset to index it.\n"
+        "• `/autobulk START END PREFIX` - Mass index messages.\n"
+        "• `/setkey PASSWORD` - Lock the current group chat."
+    )
+    return text, InlineKeyboardMarkup(keyboard)
 
 async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -156,75 +170,124 @@ async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_
     if action == "stats": await get_stats(update, context)
     elif action == "export": await export_data(update, context)
     elif action == "manage": await manage_db_start(update, context); await query.delete_message()
+    elif action == "remind": await start_remind(update, context); await query.delete_message()
     elif action == "close": await query.delete_message()
     await query.answer()
 
 async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r_c = await reminders_col.count_documents({})
     c_c = await codes_col.count_documents({})
-    await update.effective_message.reply_text(f"📊 Stats:\nReminders: {r_c}\nIndexed: {c_c}")
+    k_c = await group_keys_col.count_documents({})
+    await update.effective_message.reply_text(
+        f"📊 **System Statistics**\n\n"
+        f"📅 Active Reminders: {r_c}\n"
+        f"🔑 Indexed Assets: {c_c}\n"
+        f"🔐 Locked Groups: {k_c}",
+        parse_mode="Markdown"
+    )
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cursor = reminders_col.find({})
     data = await cursor.to_list(length=None)
     for r in data: r['_id'] = str(r['_id'])
     with open("export.json", "w") as f: json.dump(data, f, indent=4)
-    await update.effective_message.reply_document(document=open("export.json", "rb"))
+    await update.effective_message.reply_document(document=open("export.json", "rb"), filename="database_backup.json")
     os.remove("export.json")
 
 async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or not context.args: return
+    if update.effective_user.id != ADMIN_ID or not context.args: 
+        await update.message.reply_text("❌ Usage: `/setkey PASSWORD`")
+        return
     await group_keys_col.update_one({"chat_id": update.effective_chat.id}, {"$set": {"secret_key": context.args[0].strip()}}, upsert=True)
-    await update.message.reply_text("🔒 Key set!")
+    await update.message.reply_text("🔒 Custom security password set for this group partition!")
 
 async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or len(context.args) < 3: return
-    start_id, end_id, prefix = int(context.args[0]), int(context.args[1]), context.args[2].upper().strip()
-    exist = await codes_col.count_documents({"chat_id": update.effective_chat.id, "code": {"$regex": f"^{prefix}"}})
-    curr = exist + 1
-    msg = await update.message.reply_text(f"🔄 Starting from {prefix}{curr:03d}...")
-    for m_id in range(start_id, end_id + 1):
-        code = f"{prefix}{curr:03d}"
-        await codes_col.update_one({"code": code}, {"$set": {"chat_id": update.effective_chat.id, "message_id": m_id}}, upsert=True)
-        curr += 1
-    await msg.edit_text(f"✅ Indexed new batch up to {prefix}{curr-1:03d}")
+    if update.effective_user.id != ADMIN_ID or len(context.args) < 3: 
+        await update.message.reply_text("❌ Usage: `/autobulk START END PREFIX`")
+        return
+    try:
+        start_id, end_id, prefix = int(context.args[0]), int(context.args[1]), context.args[2].upper().strip()
+        exist = await codes_col.count_documents({"chat_id": update.effective_chat.id, "code": {"$regex": f"^{prefix}"}})
+        curr = exist + 1
+        msg = await update.message.reply_text(f"🔄 Starting from {prefix}{curr:03d}...")
+        for m_id in range(start_id, end_id + 1):
+            code = f"{prefix}{curr:03d}"
+            await codes_col.update_one({"code": code}, {"$set": {"chat_id": update.effective_chat.id, "message_id": m_id}}, upsert=True)
+            curr += 1
+        await msg.edit_text(f"✅ Matrix build finalized! Indexed up to {prefix}{curr-1:03d}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message or not context.args: return
+    if not update.message.reply_to_message or not context.args: 
+        await update.message.reply_text("❌ Reply to a message with `/save CODE`")
+        return
     code = context.args[0].upper().strip()
     await codes_col.update_one({"code": code}, {"$set": {"chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, upsert=True)
-    await update.message.reply_text(f"✅ Saved as {code}")
+    await update.message.reply_text(f"✅ Mapping for '{code}' written to index!")
 
 # --- REMINDERS ---
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["🇺🇿 Tashkent"], [KeyboardButton("📍 Location", request_location=True)]]
-    await update.message.reply_text("Step 1: Timezone", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True))
+    kb = [["🇺🇿 Tashkent/Uzbekistan"], [KeyboardButton("📍 Share Location", request_location=True)]]
+    await update.effective_message.reply_text("Step 1: Select timezone or share location:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True))
     return GET_TZ_CHOICE
 
 async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = tf.timezone_at(lng=update.message.location.longitude, lat=update.message.location.latitude) if update.message.location else "Asia/Tashkent"
     context.user_data['timezone'] = tz
-    await update.message.reply_text(f"✅ {tz}\nStep 2: Date (YYYY-MM-DD)")
+    await update.message.reply_text(f"✅ Timezone: {tz}\nStep 2: Enter target date (YYYY-MM-DD):")
     return GET_DATE
 
 async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['target_date'] = update.message.text
-    await update.message.reply_text("Step 3: Time (HH:MM)")
-    return GET_TIME
+    try:
+        datetime.strptime(update.message.text, "%Y-%m-%d")
+        context.user_data['target_date'] = update.message.text
+        await update.message.reply_text("Step 3: Daily reminder time (HH:MM in 24h format):")
+        return GET_TIME
+    except:
+        await update.message.reply_text("❌ Use YYYY-MM-DD.")
+        return GET_DATE
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['reminder_time'] = update.message.text
-    await update.message.reply_text("Step 4: Label")
-    return GET_LABEL
+    try:
+        datetime.strptime(update.message.text, "%H:%M")
+        context.user_data['reminder_time'] = update.message.text
+        await update.message.reply_text("Step 4: Label for this reminder:")
+        return GET_LABEL
+    except:
+        await update.message.reply_text("❌ Use HH:MM.")
+        return GET_TIME
 
 async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = {"user_id": update.effective_user.id, "timezone": context.user_data['timezone'], "target_date": context.user_data['target_date'], "reminder_time": context.user_data['reminder_time'], "label": update.message.text}
     res = await reminders_col.insert_one(data)
     data['_id'] = res.inserted_id
     schedule_reminder_job(application, data)
-    await update.message.reply_text("✅ Active!")
+    await update.message.reply_text("✅ New reminder is active!")
     return ConversationHandler.END
+
+# --- GREETING LOGIC ---
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id == ADMIN_ID:
+        text, markup = await admin_palette_msg(update, context)
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        greeting = (
+            "👋 **Welcome to your Personal Assistant Node.**\n\n"
+            "⏰ **Reminder System:**\n"
+            "• `/remind` - Schedule a daily countdown to a specific date.\n"
+            "• Set your timezone via location or manual selection.\n\n"
+            "📦 **Storage Infrastructure:**\n"
+            "• Enter a valid Alphanumeric Code (e.g., `AAA001`) to retrieve target assets.\n"
+            "• **Note:** Some collections require a `SECRET_KEY` for access.\n\n"
+            "💡 **Getting Started:**\n"
+            "Just type `/remind` to set your first alert or enter a file code to get data!"
+        )
+        await update.message.reply_text(greeting, parse_mode="Markdown")
 
 # --- ROUTING ---
 
@@ -253,7 +316,7 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
                 record = await codes_col.find_one({"code": code})
                 if record: await execute_file_delivery(chat_id, record, context)
         else:
-            m = await update.message.reply_text("❌ Denied.")
+            m = await update.message.reply_text("❌ Access Denied. Correct key?")
             context.job_queue.run_once(delete_msg_callback, 10, data={"chat_id": chat_id, "message_id": m.message_id})
         return
 
@@ -269,7 +332,7 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
                 if not auth or record["chat_id"] not in auth.get("unlocked_chats", []):
                     context.user_data['pending_unlock_group_id'] = record["chat_id"]
                     context.user_data['interrupted_file_code'] = text
-                    alert = await context.bot.send_message(chat_id, "🔒 Locked. Enter Key:")
+                    alert = await context.bot.send_message(chat_id, "🔒 This collection is locked. Enter SECRET_KEY:")
                     context.user_data['alert_message_id'] = alert.message_id
                     return
         await execute_file_delivery(chat_id, record, context)
@@ -277,7 +340,7 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
 async def execute_file_delivery(chat_id, record, context):
     try:
         copied = await context.bot.copy_message(chat_id=chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
-        warn = await context.bot.send_message(chat_id, "⚠️ **EPHEMERAL:** 6m countdown.", parse_mode="Markdown")
+        warn = await context.bot.send_message(chat_id, "⚠️ **EPHEMERAL:** This data will self-destruct in 6 minutes.", parse_mode="Markdown")
         context.job_queue.run_once(delete_msg_callback, 360, data={"chat_id": chat_id, "message_id": copied.message_id})
         context.job_queue.run_once(delete_msg_callback, 360, data={"chat_id": chat_id, "message_id": warn.message_id})
     except Exception as e:
@@ -297,12 +360,18 @@ def create_application():
         states={MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_prefix)], MANAGE_ACTION: [CallbackQueryHandler(handle_manage_action, pattern="^act_"), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_prefix_text)]},
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
     )
-    app.add_handler(CommandHandler("start", lambda u,c: u.message.reply_text("👋 Assistant Online.")))
-    app.add_handler(CommandHandler("admin", admin_palette))
+    
+    # Handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("admin", lambda u,c: start_command(u,c))) # Manual trigger
     app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
+    
     app.add_handler(CommandHandler("save", save_message))
     app.add_handler(CommandHandler("autobulk", auto_bulk_register))
     app.add_handler(CommandHandler("setkey", set_group_key))
+    app.add_handler(CommandHandler("stats", get_stats))
+    app.add_handler(CommandHandler("export", export_data))
+    
     app.add_handler(rem_conv)
     app.add_handler(man_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
@@ -311,7 +380,7 @@ def create_application():
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
-def health(): return "Cluster Online."
+def health(): return "Master Storage Engine Live Cluster Online."
 
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
