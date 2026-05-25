@@ -4,6 +4,7 @@ import asyncio
 import sys
 import json
 import threading
+import html
 from datetime import datetime, time, timedelta
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -59,7 +60,16 @@ codes_col = db.saved_codes if db is not None else None
 group_keys_col = db.group_keys if db is not None else None
 unlocked_groups_col = db.unlocked_users if db is not None else None
 logs_col = db.system_logs if db is not None else None
-tf = TimezoneFinder()
+users_col = db.users if db is not None else None # New collection for user data
+
+# Initialize TimezoneFinder once
+logger.info("Initializing TimezoneFinder...")
+try:
+    tf = TimezoneFinder()
+    logger.info("TimezoneFinder initialized.")
+except Exception as e:
+    logger.error(f"Failed to initialize TimezoneFinder: {e}")
+    tf = None
 
 # Conversation States
 GET_TZ_CHOICE, GET_DATE, GET_TIME, GET_LABEL = range(4)
@@ -82,6 +92,28 @@ async def log_event(user_id, username, action):
         })
     except Exception as e:
         logger.error(f"Logging error: {e}")
+
+async def save_user_info(user, location=None):
+    if users_col is None: return
+    try:
+        update_data = {
+            "username": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "last_seen": datetime.utcnow()
+        }
+        if location:
+            update_data["location"] = {
+                "lat": location.latitude,
+                "lng": location.longitude
+            }
+        await users_col.update_one(
+            {"user_id": user.id},
+            {"$set": update_data},
+            upsert=True
+        )
+    except Exception as e:
+        logger.error(f"Error saving user info: {e}")
 
 async def delete_msg_callback(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
@@ -154,6 +186,7 @@ async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     action = query.data.split('_')[1]
     if action == "stats": await get_stats(update, context)
+    elif action == "users": await get_user_directory(update, context) # New action
     elif action == "export": await export_data(update, context)
     elif action == "alllists": await get_all_lists(update, context)
     elif action == "keys": await get_key_matrix(update, context)
@@ -167,6 +200,8 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c_c = await codes_col.count_documents({})
     l_c = await logs_col.count_documents({})
     k_c = await group_keys_col.count_documents({})
+    u_c = await users_col.count_documents({}) if users_col is not None else 0
+    
     msg = (
         "📊 **SYSTEM AUDIT REPORT**\n"
         "───────────────────\n"
@@ -174,44 +209,86 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 **Indexed Assets:**   `{c_c:03d}`\n"
         f"🔐 **Locked Groups:**    `{k_c:03d}`\n"
         f"📋 **Stored Logs:**      `{l_c:03d}`\n"
+        f"👤 **Unique Users:**     `{u_c:03d}`\n"
         "───────────────────\n"
         "*Auto-cleaning active: Logs purge every 7 days.*"
     )
-    await update.effective_message.reply_text(msg, parse_mode="Markdown")
+    # Add User Directory button as requested
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("👤 View User Directory", callback_data="pal_users")]])
+    await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+async def get_user_directory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if users_col is None: return
+    try:
+        cursor = users_col.find({}).sort("last_seen", -1).limit(50)
+        users = await cursor.to_list(length=50)
+        if not users: return await update.effective_message.reply_text("👤 No user data found.")
+        
+        report = ["👤 <b>USER DIRECTORY</b>\n"]
+        for u in users:
+            uname = f"@{u.get('username')}" if u.get('username') else "No Username"
+            name = html.escape(f"{u.get('first_name', '')} {u.get('last_name', '')}".strip())
+            loc = u.get('location')
+            loc_str = f"📍 {loc['lat']:.2f}, {loc['lng']:.2f}" if loc else "📍 No Location"
+            report.append(f"• <b>{name}</b> ({uname})\n  {loc_str}")
+        
+        await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"User directory error: {e}")
+        await update.effective_message.reply_text("❌ Failed to retrieve user directory.")
 
 async def get_all_lists(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reminders_col is None: return
-    cursor = reminders_col.find({}).sort("user_id", 1)
-    reminders = await cursor.to_list(length=50)
-    if not reminders: return await update.effective_message.reply_text("📜 No active reminders.")
-    report = ["📜 **GLOBAL REMINDER AUDIT**\n"]
-    for r in reminders: report.append(f"👤 `{r['user_id']}`: {r['label']} ({r['target_date']})")
-    await update.effective_message.reply_text("\n".join(report), parse_mode="Markdown")
+    try:
+        cursor = reminders_col.find({}).sort("user_id", 1)
+        reminders = await cursor.to_list(length=50)
+        if not reminders: return await update.effective_message.reply_text("📜 No active reminders.")
+        report = ["📜 <b>GLOBAL REMINDER AUDIT</b>\n"]
+        for r in reminders:
+            label = html.escape(str(r.get('label', 'No Label')))
+            report.append(f"👤 <code>{r['user_id']}</code>: {label} ({r['target_date']})")
+        await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Audit error: {e}")
+        await update.effective_message.reply_text("❌ Audit failed.")
 
 async def get_key_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if codes_col is None: return
-    pipeline = [{"$project": {"prefix": {"$substr": ["$code", 0, 3]}, "chat_id": 1}}, {"$group": {"_id": {"prefix": "$prefix", "chat_id": "$chat_id"}, "count": {"$sum": 1}}}]
-    cursor = codes_col.aggregate(pipeline)
-    results = await cursor.to_list(length=100)
-    if not results: return await update.effective_message.reply_text("🗝️ No indexed groups.")
-    report = ["🗝️ **LIVE SECRET KEY MATRIX**\n"]
-    for r in results:
-        prefix, chat_id, count = r['_id']['prefix'], r['_id']['chat_id'], r['count']
-        key_record = await group_keys_col.find_one({"chat_id": chat_id})
-        passkey = key_record["secret_key"] if key_record else "NO KEY SET"
-        report.append(f"• `{prefix}` - {count:02d} items  =>  `{passkey}`")
-    await update.effective_message.reply_text("\n".join(report), parse_mode="Markdown")
+    try:
+        pipeline = [{"$project": {"prefix": {"$substr": ["$code", 0, 3]}, "chat_id": 1}}, {"$group": {"_id": {"prefix": "$prefix", "chat_id": "$chat_id"}, "count": {"$sum": 1}}}]
+        cursor = codes_col.aggregate(pipeline)
+        results = await cursor.to_list(length=100)
+        if not results: return await update.effective_message.reply_text("🗝️ No indexed groups.")
+        report = ["🗝️ <b>LIVE SECRET KEY MATRIX</b>\n"]
+        for r in results:
+            prefix, chat_id, count = r['_id']['prefix'], r['_id']['chat_id'], r['count']
+            key_record = await group_keys_col.find_one({"chat_id": chat_id})
+            passkey = html.escape(key_record["secret_key"] if key_record else "NO KEY SET")
+            report.append(f"• <code>{prefix}</code> - {count:02d} items  =>  <code>{passkey}</code>")
+        await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Key Matrix error: {e}")
+        await update.effective_message.reply_text("❌ Key Matrix failed.")
 
 async def get_system_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if logs_col is None: return
-    cursor = logs_col.find({}).sort("timestamp", -1).limit(15)
-    logs = await cursor.to_list(length=15)
-    if not logs: return await update.effective_message.reply_text("📋 Logs empty.")
-    report = ["📋 **SYSTEM ACTIVITY LOGS**\n"]
-    for l in logs:
-        time_str = l['timestamp'].strftime('%H:%M:%S')
-        report.append(f"`[{time_str}]` {l['username']}: {l['action']}")
-    await update.effective_message.reply_text("\n".join(report), parse_mode="Markdown")
+    try:
+        cursor = logs_col.find({}).sort("timestamp", -1).limit(15)
+        logs = await cursor.to_list(length=15)
+        if not logs: 
+            return await update.effective_message.reply_text("📋 Logs empty.")
+        
+        report = ["📋 <b>SYSTEM ACTIVITY LOGS</b>\n"]
+        for l in logs:
+            time_str = l['timestamp'].strftime('%H:%M:%S')
+            user = html.escape(str(l.get('username', 'Unknown')))
+            action = html.escape(str(l.get('action', 'Unknown')))
+            report.append(f"<code>[{time_str}]</code> {user}: {action}")
+        
+        await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error retrieving logs: {e}")
+        await update.effective_message.reply_text("❌ Failed to retrieve logs.")
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reminders_col is None: return
@@ -283,12 +360,21 @@ async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reminders_col is None: return
     user_id = update.effective_user.id
-    cursor = reminders_col.find({"user_id": user_id})
-    reminders = await cursor.to_list(length=10)
-    if not reminders: return await update.effective_message.reply_text("No active reminders.")
-    for r in reminders:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Delete 🗑️", callback_data=f"delrem_{r['_id']}")]])
-        await update.effective_message.reply_text(f"🔔 *{r['label']}*\n📅 {r['target_date']} | ⏰ {r['reminder_time']}", reply_markup=kb, parse_mode="Markdown")
+    try:
+        cursor = reminders_col.find({"user_id": user_id})
+        reminders = await cursor.to_list(length=10)
+        if not reminders: return await update.effective_message.reply_text("No active reminders.")
+        for r in reminders:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("Delete 🗑️", callback_data=f"delrem_{r['_id']}")]])
+            label = html.escape(str(r.get('label', 'No Label')))
+            await update.effective_message.reply_text(
+                f"🔔 <b>{label}</b>\n📅 {r['target_date']} | ⏰ {r['reminder_time']}", 
+                reply_markup=kb, 
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"List error: {e}")
+        await update.effective_message.reply_text("❌ Failed to list reminders.")
 
 async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -299,30 +385,80 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear() # Clear state for fresh start
     kb = [["🇺🇿 Tashkent/Uzbekistan"], [KeyboardButton("📍 Share Location", request_location=True)]]
-    await update.effective_message.reply_text("Step 1: Timezone", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True))
+    await update.effective_message.reply_text(
+        "Step 1: Timezone\nPlease select a city or share your location for precision:", 
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+    )
     return GET_TZ_CHOICE
 
 async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tz = tf.timezone_at(lng=update.message.location.longitude, lat=update.message.location.latitude) if update.message.location else "Asia/Tashkent"
-    context.user_data['timezone'] = tz
-    await update.message.reply_text(f"✅ Timezone: {tz}\nStep 2: Enter date (YYYY-MM-DD):")
-    return GET_DATE
+    try:
+        msg = update.effective_message
+        user = update.effective_user
+        if not msg: return GET_TZ_CHOICE
+
+        # Capture user info regardless of choice
+        await save_user_info(user, location=msg.location)
+
+        # Robust location check
+        if msg.location:
+            logger.info(f"Received location update from user {user.id}")
+            lat, lng = msg.location.latitude, msg.location.longitude
+            if tf:
+                timezone_str = tf.timezone_at(lng=lng, lat=lat) or "UTC"
+            else:
+                logger.error("TimezoneFinder not initialized. Using UTC.")
+                timezone_str = "UTC"
+        else:
+            choice = msg.text or ""
+            timezone_str = "Asia/Tashkent" if "Tashkent" in choice else "Asia/Tashkent"
+                
+        context.user_data['timezone'] = timezone_str
+        await msg.reply_text(f"✅ Timezone set to: {timezone_str}\nStep 2: Enter target date (YYYY-MM-DD):")
+        return GET_DATE
+
+    except Exception as e:
+        logger.error(f"CRITICAL Error in handle_tz_choice: {e}", exc_info=True)
+        context.user_data['timezone'] = "Asia/Tashkent"
+        await update.effective_message.reply_text(
+            f"❌ Timezone detection failed. Defaulting to Asia/Tashkent.\n\nStep 2: Enter target date (YYYY-MM-DD):"
+        )
+        return GET_DATE
 
 async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['target_date'] = update.message.text
-    await update.message.reply_text("Step 3: Enter time (HH:MM):")
-    return GET_TIME
+    text = update.message.text
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+        context.user_data['target_date'] = text
+        await update.message.reply_text("Step 3: Enter time (HH:MM) - e.g., 09:00:")
+        return GET_TIME
+    except ValueError:
+        await update.message.reply_text("❌ Invalid date format. Please use YYYY-MM-DD:")
+        return GET_DATE
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['reminder_time'] = update.message.text
-    await update.message.reply_text("Step 4: Enter label:")
-    return GET_LABEL
+    text = update.message.text
+    try:
+        datetime.strptime(text, "%H:%M")
+        context.user_data['reminder_time'] = text
+        await update.message.reply_text("Step 4: Enter a label for this reminder:")
+        return GET_LABEL
+    except ValueError:
+        await update.message.reply_text("❌ Invalid time format. Please use HH:MM (24h format):")
+        return GET_TIME
 
 async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reminders_col is None: return ConversationHandler.END
     user = update.effective_user
-    data = {"user_id": user.id, "timezone": context.user_data['timezone'], "target_date": context.user_data['target_date'], "reminder_time": context.user_data['reminder_time'], "label": update.message.text}
+    data = {
+        "user_id": user.id, 
+        "timezone": context.user_data['timezone'], 
+        "target_date": context.user_data['target_date'], 
+        "reminder_time": context.user_data['reminder_time'], 
+        "label": update.message.text
+    }
     res = await reminders_col.insert_one(data)
     data['_id'] = res.inserted_id
     schedule_reminder_job(application, data)
@@ -335,6 +471,7 @@ async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    await save_user_info(user) # Basic info storage on start
     if user.id == ADMIN_ID:
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
@@ -345,8 +482,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or codes_col is None: return
     if context.user_data.get('timezone'): return
+    
     user, chat_id, text = update.effective_user, update.effective_chat.id, update.message.text.strip().upper()
     is_admin = (user.id == ADMIN_ID)
+    await save_user_info(user) # Track user activity
 
     # UNLOCK
     pending = context.user_data.get('pending_unlock_group_id')
@@ -402,7 +541,15 @@ def create_application():
     app = ApplicationBuilder().token(TOKEN).build()
     rem_conv = ConversationHandler(
         entry_points=[CommandHandler("remind", start_remind)],
-        states={GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)], GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)], GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]},
+        states={
+            GET_TZ_CHOICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), 
+                MessageHandler(filters.LOCATION, handle_tz_choice)
+            ], 
+            GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], 
+            GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)], 
+            GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]
+        },
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))],
         per_message=False
     )
@@ -431,9 +578,18 @@ def create_application():
 flask_app = Flask(__name__)
 @flask_app.route('/')
 def health(): return "Supreme Commander Node Online."
+
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
-    if main_loop: asyncio.run_coroutine_threadsafe(application.process_update(Update.de_json(request.get_json(force=True), application.bot)), main_loop)
+    if main_loop: 
+        try:
+            update_data = request.get_json(force=True)
+            asyncio.run_coroutine_threadsafe(
+                application.process_update(Update.de_json(update_data, application.bot)), 
+                main_loop
+            )
+        except Exception as e:
+            logger.error(f"Webhook processing error: {e}")
     return "OK"
 
 async def main():
@@ -442,22 +598,34 @@ async def main():
         server = make_server('0.0.0.0', PORT, flask_app)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         while True: await asyncio.sleep(3600)
+    
     main_loop = asyncio.get_running_loop()
-    try: await logs_col.create_index("timestamp", expireAfterSeconds=604800)
+    
+    # DB Cleanup/Index
+    try: 
+        await logs_col.create_index("timestamp", expireAfterSeconds=604800)
+        await users_col.create_index("user_id", unique=True)
     except: pass
+    
     application = create_application()
     await application.initialize()
     await application.start()
+    
+    # Reschedule reminders
     try:
         cursor = reminders_col.find({})
         async for r in cursor: schedule_reminder_job(application, r)
     except: pass
+    
+    # Set Webhook
     try: await application.bot.set_webhook(url=f"{RENDER_URL.rstrip('/')}/{TOKEN}")
     except: pass
+    
     server = make_server('0.0.0.0', PORT, flask_app)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     while True: await asyncio.sleep(3600)
 
 if __name__ == '__main__':
     try: asyncio.run(main())
-    except: pass
+    except Exception as e:
+        logger.critical(f"FATAL SHUTDOWN: {e}", exc_info=True)
