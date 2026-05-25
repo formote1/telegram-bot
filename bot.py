@@ -497,7 +497,7 @@ def health(): return "Master Storage Engine Live Cluster Online."
 def webhook():
     if main_loop:
         update = Update.de_json(request.get_json(force=True), application.bot)
-        main_loop.call_soon_threadsafe(application.update_queue.put_nowait, update)
+        asyncio.run_coroutine_threadsafe(application.process_update(update), main_loop)
     return "OK"
 
 async def main():
