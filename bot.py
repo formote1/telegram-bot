@@ -490,6 +490,8 @@ def create_application():
     
     return app
 
+flask_app = Flask(__name__)
+
 @flask_app.route('/')
 def health(): return "Master Storage Engine Live Cluster Online."
 
