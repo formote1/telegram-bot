@@ -1,9 +1,9 @@
 python-telegram-bot[job-queue]==21.1
 motor==3.4.0
-pymongo==4.6.3
+pymongo==4.7.2
 dnspython==2.6.1
 apscheduler==3.10.4
 timezonefinder==6.5.0
 flask==3.0.3
 gunicorn==22.0.0
-pytz
+pytz==2024.1
