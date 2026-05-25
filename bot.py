@@ -208,7 +208,9 @@ async def get_system_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logs = await cursor.to_list(length=15)
     if not logs: return await update.effective_message.reply_text("📋 Logs empty.")
     report = ["📋 **SYSTEM ACTIVITY LOGS**\n"]
-    for l in logs: report.append(f"`[{l['timestamp'].strftime('%H:%M:%S')]` {l['username']}: {l['action']}")
+    for l in logs:
+        time_str = l['timestamp'].strftime('%H:%M:%S')
+        report.append(f"`[{time_str}]` {l['username']}: {l['action']}")
     await update.effective_message.reply_text("\n".join(report), parse_mode="Markdown")
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
