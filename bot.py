@@ -14,7 +14,7 @@ from telegram import (
     InlineQueryResultArticle, InputTextMessageContent,
     InlineQueryResultCachedDocument, InlineQueryResultCachedVideo,
     InlineQueryResultCachedPhoto, InlineQueryResultCachedAudio,
-    InlineQueryResultCachedVoice, InlineQueryResultCachedAnimation
+    InlineQueryResultCachedVoice, InlineQueryResultCachedMpeg4Gif
 )
 from telegram.ext import (
     ApplicationBuilder, 
