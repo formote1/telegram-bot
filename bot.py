@@ -6,13 +6,11 @@ import json
 import threading
 import html
 import uuid
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 import pytz
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton, 
     InlineKeyboardButton, InlineKeyboardMarkup,
-    InlineQueryResultCachedDocument, InlineQueryResultCachedAudio,
-    InlineQueryResultCachedVideo, InlineQueryResultCachedVoice,
     InlineQueryResultArticle, InputTextMessageContent
 )
 from telegram.ext import (
@@ -46,6 +44,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 ADMIN_ID_RAW = os.getenv("ADMIN_USER_ID", "0")
 PORT = int(os.getenv("PORT", 10000))
 
+# Validate critical variables
 missing_vars = []
 if not TOKEN: missing_vars.append("TELEGRAM_TOKEN")
 if not MONGO_URI: missing_vars.append("MONGO_URI")
@@ -69,6 +68,7 @@ unlocked_groups_col = db.unlocked_users if db is not None else None
 logs_col = db.system_logs if db is not None else None
 users_col = db.users if db is not None else None 
 
+# Initialize TimezoneFinder once
 logger.info("Initializing TimezoneFinder...")
 try:
     tf = TimezoneFinder()
@@ -77,9 +77,11 @@ except Exception as e:
     logger.error(f"Failed to initialize TimezoneFinder: {e}")
     tf = None
 
+# Conversation States
 GET_TZ_CHOICE, GET_DATE, GET_TIME, GET_LABEL = range(4)
 MANAGE_CHOOSE_PREFIX = 4
 
+# Global instances
 application = None
 main_loop = None
 
@@ -107,8 +109,15 @@ async def save_user_info(user, location=None):
             "last_seen": datetime.utcnow()
         }
         if location:
-            update_data["location"] = {"lat": location.latitude, "lng": location.longitude}
-        await users_col.update_one({"user_id": user.id}, {"$set": update_data}, upsert=True)
+            update_data["location"] = {
+                "lat": location.latitude,
+                "lng": location.longitude
+            }
+        await users_col.update_one(
+            {"user_id": user.id},
+            {"$set": update_data},
+            upsert=True
+        )
     except Exception as e:
         logger.error(f"Error saving user info: {e}")
 
@@ -138,27 +147,35 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
         now = datetime.now(tz).date()
         target = datetime.strptime(data['target_date'], "%Y-%m-%d").date()
         days_left = (target - now).days
+        
         if days_left >= 0:
-            msg = f"🔔 REMINDER: {days_left} days left to '{data['label']}'!" if days_left > 0 else f"🎉 TODAY IS THE DAY: '{data['label']}'!"
+            if days_left > 0:
+                if days_left < 15:
+                    time_str = f"{days_left} day{'s' if days_left > 1 else ''}"
+                else:
+                    years = days_left // 365
+                    rem_days = days_left % 365
+                    weeks = rem_days // 7
+                    days = rem_days % 7
+                    
+                    parts = []
+                    if years > 0: parts.append(f"{years} year{'s' if years > 1 else ''}")
+                    if weeks > 0: parts.append(f"{weeks} week{'s' if weeks > 1 else ''}")
+                    if days > 0: parts.append(f"{days} day{'s' if days > 1 else ''}")
+                    
+                    time_str = " ".join(parts) if parts else "0 days"
+                    
+                msg = f"🔔 REMINDER: {time_str} left to '{data['label']}'!"
+            else:
+                msg = f"🎉 TODAY IS THE DAY: '{data['label']}'!"
+                
             await context.bot.send_message(chat_id=job.chat_id, text=msg)
+            
             if days_left == 0 and reminders_col is not None:
                 await reminders_col.delete_one({"_id": data['_id']})
                 job.schedule_removal()
         else: job.schedule_removal()
     except Exception as e: logger.error(f"Reminder error: {e}")
-
-def extract_media_meta(message):
-    """Helper to pull unique file identifier properties from compound objects."""
-    if message.document:
-        return message.document.file_id, "document", message.document.file_name or "Document"
-    elif message.audio:
-        title = f"{message.audio.performer or ''} - {message.audio.title or ''}".strip()
-        return message.audio.file_id, "audio", title or "Audio"
-    elif message.video:
-        return message.video.file_id, "video", "Video Asset"
-    elif message.voice:
-        return message.voice.file_id, "voice", "Voice Memo"
-    return None, None, None
 
 # --- MASTER CONSOLE & ADMIN OPS ---
 
@@ -169,16 +186,30 @@ async def admin_palette_msg():
         [InlineKeyboardButton("🗑️ Manage DB", callback_data="pal_manage"), InlineKeyboardButton("📋 System Logs", callback_data="pal_logs")]
     ]
     text = (
-        "👑 **MASTER CONSOLE**\n"
+        "👑 **MASTER CONSOLE** 🔞\n"
         "───────────────────────\n"
         "**System Status:** 🌐 Operational\n"
         "───────────────────────\n"
         "📜 **COMPLETE COMMAND LIST:**\n\n"
-        "• `/save CODE` - Index media file explicitly (by reply)\n"
-        "• `/del CODE` - Drop asset index record\n"
-        "• `/setkey PREFIX PASSWORD` - Secure prefix cluster partitions\n\n"
-        "⚡ **INLINE QUERY INTERFACE:**\n"
-        "`@bot CODE` -> Instantly delivers media asset payload without bot being inside target chat context."
+        "**Core Commands:**\n"
+        "• `/start` - Launch node / Admin Dashboard\n"
+        "• `/remind` - Setup new countdown reminder\n"
+        "• `/list` - View your personal reminders\n\n"
+        "**Database Matrix:**\n"
+        "• `/save CODE` - Index message (by reply)\n"
+        "• `/autobulk START END PREFIX` - Mass index\n"
+        "• `/del CODE` - Single file delete\n"
+        "• `/del PREFIX START END` - Surgical range delete\n"
+        "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n\n"
+        "**File Retrieval Engine:**\n"
+        "• `/get CODE` - Fetch a single specific asset\n"
+        "• `/get PREFIX START END` - Sequential range delivery\n\n"
+        "**Monitoring:**\n"
+        "• `/stats` - Live system audit report\n"
+        "• `/export` - Full database JSON backup\n"
+        "• `/admin` - Re-trigger this Master Console\n"
+        "───────────────────────\n"
+        "Select a monitoring tool below:"
     )
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -207,10 +238,11 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "───────────────────\n"
         f"📅 **Total Reminders:** `{r_c:03d}`\n"
         f"🔑 **Indexed Assets:** `{c_c:03d}`\n"
-        f"🔐 **Locked Clusters:** `{k_c:03d}`\n"
+        f"🔐 **Locked Prefixes:** `{k_c:03d}`\n"
         f"📋 **Stored Logs:** `{l_c:03d}`\n"
         f"👤 **Unique Users:** `{u_c:03d}`\n"
-        "───────────────────"
+        "───────────────────\n"
+        "*Auto-cleaning active: Logs purge every 7 days.*"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("👤 View User Directory", callback_data="pal_users")]])
     await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
@@ -221,6 +253,7 @@ async def get_user_directory(update: Update, context: ContextTypes.DEFAULT_TYPE)
         cursor = users_col.find({}).sort("last_seen", -1).limit(50)
         users = await cursor.to_list(length=50)
         if not users: return await update.effective_message.reply_text("👤 No user data found.")
+        
         report = ["👤 <b>USER DIRECTORY</b>\n"]
         for u in users:
             uname = f"@{u.get('username')}" if u.get('username') else "No Username"
@@ -228,8 +261,10 @@ async def get_user_directory(update: Update, context: ContextTypes.DEFAULT_TYPE)
             loc = u.get('location')
             loc_str = f"📍 {loc['lat']:.2f}, {loc['lng']:.2f}" if loc else "📍 No Location"
             report.append(f"• <b>{name}</b> ({uname})\n  {loc_str}")
+        
         await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
     except Exception as e:
+        logger.error(f"User directory error: {e}")
         await update.effective_message.reply_text("❌ Failed to retrieve user directory.")
 
 async def get_all_lists(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,19 +279,25 @@ async def get_all_lists(update: Update, context: ContextTypes.DEFAULT_TYPE):
             report.append(f"👤 <code>{r['user_id']}</code>: {label} ({r['target_date']})")
         await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
     except Exception as e:
+        logger.error(f"Audit error: {e}")
         await update.effective_message.reply_text("❌ Audit failed.")
 
 async def get_key_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if group_keys_col is None: return
+    if codes_col is None: return
     try:
-        cursor = group_keys_col.find({})
+        pipeline = [{"$project": {"prefix": {"$substr": ["$code", 0, 3]}, "chat_id": 1}}, {"$group": {"_id": {"prefix": "$prefix", "chat_id": "$chat_id"}, "count": {"$sum": 1}}}]
+        cursor = codes_col.aggregate(pipeline)
         results = await cursor.to_list(length=100)
-        if not results: return await update.effective_message.reply_text("🗝️ No keys assigned.")
+        if not results: return await update.effective_message.reply_text("🗝️ No indexed groups.")
         report = ["🗝️ <b>LIVE SECRET KEY MATRIX</b>\n"]
         for r in results:
-            report.append(f"• Cluster Prefix: <code>{r['prefix']}</code>  => Key:  <code>{html.escape(r['secret_key'])}</code>")
+            prefix, chat_id, count = r['_id']['prefix'], r['_id']['chat_id'], r['count']
+            key_record = await group_keys_col.find_one({"chat_id": chat_id, "prefix": prefix})
+            passkey = html.escape(key_record["secret_key"] if key_record else "NO KEY SET")
+            report.append(f"• <code>{prefix}</code> - {count:02d} items  =>  <code>{passkey}</code>")
         await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
     except Exception as e:
+        logger.error(f"Key Matrix error: {e}")
         await update.effective_message.reply_text("❌ Key Matrix failed.")
 
 async def get_system_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -264,15 +305,19 @@ async def get_system_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         cursor = logs_col.find({}).sort("timestamp", -1).limit(15)
         logs = await cursor.to_list(length=15)
-        if not logs: return await update.effective_message.reply_text("📋 Logs empty.")
+        if not logs: 
+            return await update.effective_message.reply_text("📋 Logs empty.")
+        
         report = ["📋 <b>SYSTEM ACTIVITY LOGS</b>\n"]
         for l in logs:
             time_str = l['timestamp'].strftime('%H:%M:%S')
             user = html.escape(str(l.get('username', 'Unknown')))
             action = html.escape(str(l.get('action', 'Unknown')))
             report.append(f"<code>[{time_str}]</code> {user}: {action}")
+        
         await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
     except Exception as e:
+        logger.error(f"Error retrieving logs: {e}")
         await update.effective_message.reply_text("❌ Failed to retrieve logs.")
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -292,7 +337,7 @@ async def manage_db_gui(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prefixes = await cursor.to_list(length=100)
     if not prefixes: return await update.effective_message.reply_text("Database empty.")
     keyboard = [[InlineKeyboardButton(f"Wipe {p['_id']} ({p['count']} items)", callback_data=f"pref_wipe_{p['_id']}")] for p in prefixes]
-    await update.effective_message.reply_text("🗑️ Select Cluster Prefix to WIPE ENTIRELY:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.effective_message.reply_text("🗑️ Select Prefix to WIPE ENTIRELY:", reply_markup=InlineKeyboardMarkup(keyboard))
     return MANAGE_CHOOSE_PREFIX
 
 async def handle_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,58 +345,70 @@ async def handle_manage_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     prefix = query.data.split('_')[2]
     await codes_col.delete_many({"code": {"$regex": f"^{prefix}"}})
-    await query.edit_message_text(f"🔥 **NUKE COMPLETE:** `{prefix cluster}` vaporized.", parse_mode="Markdown")
+    await query.edit_message_text(f"🔥 **NUKE COMPLETE:** `{prefix}` vaporized.", parse_mode="Markdown")
     await log_event(ADMIN_ID, "ADMIN", f"Full Wipe: {prefix}")
     return ConversationHandler.END
 
 async def range_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
     args = context.args
-    if not args: return await update.message.reply_text("❌ Usage: `/del CODE`")
-    code = args[0].upper().strip()
-    res = await codes_col.delete_one({"code": code})
-    if res.deleted_count > 0:
-        await update.message.reply_text(f"🗑️ Vaporized file mapping index `{code}`.")
-    else:
-        await update.message.reply_text(f"❌ Record lookup failed for `{code}`.")
+    if not args: 
+        return await update.message.reply_text("❌ Usage:\nSingle: `/del CODE`\nRange: `/del PREFIX START END`", parse_mode="Markdown")
+        
+    try:
+        if len(args) == 1:
+            code = args[0].upper().strip()
+            res = await codes_col.delete_one({"code": code})
+            if res.deleted_count > 0:
+                await update.message.reply_text(f"🗑️ vaporized `{code}`.", parse_mode="Markdown")
+                await log_event(ADMIN_ID, "ADMIN", f"Single Del: {code}")
+            else:
+                await update.message.reply_text(f"❌ `{code}` not found.")
+                
+        elif len(args) == 3:
+            prefix, start, end = args[0].upper().strip(), int(args[1]), int(args[2])
+            target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+            result = await codes_col.delete_many({"code": {"$in": target_codes}})
+            await update.message.reply_text(f"🗑️ vaporized `{result.deleted_count}` items.", parse_mode="Markdown")
+            await log_event(ADMIN_ID, "ADMIN", f"Range Del: {prefix}{start:03d}-{end:03d}")
+        else:
+            await update.message.reply_text("❌ Usage:\nSingle: `/del CODE`\nRange: `/del PREFIX START END`", parse_mode="Markdown")
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Error: {e}")
+
+async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or codes_col is None: return
+    if len(context.args) < 3: return
+    try:
+        start_id, end_id, prefix = int(context.args[0]), int(context.args[1]), context.args[2].upper().strip()
+        exist = await codes_col.count_documents({"chat_id": update.effective_chat.id, "code": {"$regex": f"^{prefix}"}})
+        curr = exist + 1
+        msg = await update.message.reply_text(f"🔄 **Indexing {prefix} from {curr:03d}...**", parse_mode="Markdown")
+        for m_id in range(start_id, end_id + 1):
+            await codes_col.update_one({"code": f"{prefix}{curr:03d}"}, {"$set": {"chat_id": update.effective_chat.id, "message_id": m_id}}, upsert=True)
+            curr += 1
+        await msg.edit_text(f"✅ **Build Finalized!** Indexed up to `{prefix}{curr-1:03d}`", parse_mode="Markdown")
+    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
 
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Upgraded registration routine to map and persist distinct raw binary asset file pointers."""
-    if update.effective_user.id != ADMIN_ID or codes_col is None: return
-    if not update.message.reply_to_message or not context.args:
-        return await update.message.reply_text("❌ Reply to a document/audio message with `/save CODE`")
-    
-    target_msg = update.message.reply_to_message
-    file_id, media_type, file_title = extract_media_meta(target_msg)
-    
-    if not file_id:
-        return await update.message.reply_text("❌ Target target message does not contain a supported document, audio, video, or voice file asset.")
-        
+    if not update.message.reply_to_message or not context.args or codes_col is None: return
     code = context.args[0].upper().strip()
-    prefix = ''.join([c for c in code if c.isalpha()]) or code[:3]
-    
-    payload = {
-        "code": code,
-        "prefix": prefix,
-        "file_id": file_id,
-        "media_type": media_type,
-        "title": file_title,
-        "chat_id": target_msg.chat_id,
-        "message_id": target_msg.message_id
-    }
-    
-    await codes_col.update_one({"code": code}, {"$set": payload}, upsert=True)
-    await update.message.reply_text(f"✅ Stored asset mapping safely!\n🏷️ **Code:** `{code}`\n📦 **Type:** `{media_type}`", parse_mode="Markdown")
+    await codes_col.update_one({"code": code}, {"$set": {"chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id}}, upsert=True)
+    await update.message.reply_text(f"✅ Saved as `{code}`", parse_mode="Markdown")
 
 async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or len(context.args) < 2 or group_keys_col is None: 
-        return await update.message.reply_text("❌ Usage: `/setkey PREFIX PASSWORD`")
+    if update.effective_user.id != ADMIN_ID or group_keys_col is None: return
+    if len(context.args) < 2: return await update.message.reply_text("❌ Usage: `/setkey PREFIX PASSWORD`")
     
     prefix = context.args[0].upper().strip()
     password = context.args[1].strip()
     
-    await group_keys_col.update_one({"prefix": prefix}, {"$set": {"secret_key": password}}, upsert=True)
-    await update.message.reply_text(f"🔒 Key barrier configured for cluster prefix: `{prefix}`")
+    await group_keys_col.update_one(
+        {"chat_id": update.effective_chat.id, "prefix": prefix}, 
+        {"$set": {"secret_key": password}}, 
+        upsert=True
+    )
+    await update.message.reply_text(f"🔒 Key set for prefix `{prefix}` in this group!")
 
 # --- REMINDERS ---
 
@@ -365,8 +422,13 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in reminders:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton("Delete 🗑️", callback_data=f"delrem_{r['_id']}")]])
             label = html.escape(str(r.get('label', 'No Label')))
-            await update.effective_message.reply_text(f"🔔 <b>{label}</b>\n📅 {r['target_date']} | ⏰ {r['reminder_time']}", reply_markup=kb, parse_mode="HTML")
+            await update.effective_message.reply_text(
+                f"🔔 <b>{label}</b>\n📅 {r['target_date']} | ⏰ {r['reminder_time']}", 
+                reply_markup=kb, 
+                parse_mode="HTML"
+            )
     except Exception as e:
+        logger.error(f"List error: {e}")
         await update.effective_message.reply_text("❌ Failed to list reminders.")
 
 async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -380,7 +442,10 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() 
     kb = [["🇺🇿 Tashkent/Uzbekistan"], [KeyboardButton("📍 Share Location", request_location=True)]]
-    await update.effective_message.reply_text("Step 1: Timezone\nPlease select a city or share your location for precision:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True))
+    await update.effective_message.reply_text(
+        "Step 1: Timezone\nPlease select a city or share your location for precision:", 
+        reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True)
+    )
     return GET_TZ_CHOICE
 
 async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -388,18 +453,31 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
         user = update.effective_user
         if not msg: return GET_TZ_CHOICE
+
         await save_user_info(user, location=msg.location)
+
         if msg.location:
+            logger.info(f"Received location update from user {user.id}")
             lat, lng = msg.location.latitude, msg.location.longitude
-            timezone_str = tf.timezone_at(lng=lng, lat=lat) if tf else "Asia/Tashkent"
+            if tf:
+                timezone_str = tf.timezone_at(lng=lng, lat=lat) or "UTC"
+            else:
+                logger.error("TimezoneFinder not initialized. Using UTC.")
+                timezone_str = "UTC"
         else:
-            timezone_str = "Asia/Tashkent"
-        context.user_data['timezone'] = timezone_str or "Asia/Tashkent"
-        await msg.reply_text(f"✅ Timezone set to: {context.user_data['timezone']}\nStep 2: Enter target date (YYYY-MM-DD):")
+            choice = msg.text or ""
+            timezone_str = "Asia/Tashkent" if "Tashkent" in choice else "Asia/Tashkent"
+                
+        context.user_data['timezone'] = timezone_str
+        await msg.reply_text(f"✅ Timezone set to: {timezone_str}\nStep 2: Enter target date (YYYY-MM-DD):")
         return GET_DATE
-    except Exception:
+
+    except Exception as e:
+        logger.error(f"CRITICAL Error in handle_tz_choice: {e}", exc_info=True)
         context.user_data['timezone'] = "Asia/Tashkent"
-        await update.effective_message.reply_text("❌ Timezone resolution failure. Defaulting to Asia/Tashkent.\n\nStep 2: Enter target date (YYYY-MM-DD):")
+        await update.effective_message.reply_text(
+            f"❌ Timezone detection failed. Defaulting to Asia/Tashkent.\n\nStep 2: Enter target date (YYYY-MM-DD):"
+        )
         return GET_DATE
 
 async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,10 +485,10 @@ async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%Y-%m-%d")
         context.user_data['target_date'] = text
-        await update.message.reply_text("Step 3: Enter notification time (HH:MM) 24h format:")
+        await update.message.reply_text("Step 3: Enter the time you want to be notified\n(HH:MM) 24hour format")
         return GET_TIME
     except ValueError:
-        await update.message.reply_text("❌ Invalid format. Use YYYY-MM-DD:")
+        await update.message.reply_text("❌ Invalid date format. Please use YYYY-MM-DD:")
         return GET_DATE
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -418,10 +496,10 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%H:%M")
         context.user_data['reminder_time'] = text
-        await update.message.reply_text("Step 4: Enter a description label for tracking details:")
+        await update.message.reply_text("Step 4: Enter a label for this reminder:")
         return GET_LABEL
     except ValueError:
-        await update.message.reply_text("❌ Invalid format. Use HH:MM (24h format):")
+        await update.message.reply_text("❌ Invalid time format. Please use HH:MM (24h format):")
         return GET_TIME
 
 async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,107 +529,209 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Use inline query queries anywhere: `@bot CODE` to fetch materials instantly!"
+        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Use `/get CODE` to retrieve a file.\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
 
+async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if codes_col is None: return
+    args = context.args
+    if not args:
+        return await update.message.reply_text("❌ Usage:\nSingle: `/get CODE`\nRange: `/get PREFIX START END`", parse_mode="Markdown")
+    
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    is_admin = (user.id == ADMIN_ID)
+    
+    if len(args) == 1:
+        code = args[0].upper().strip()
+        prefix = ''.join([c for c in code if c.isalpha()]) 
+        if not prefix: prefix = code[:3] 
+        
+        record = await codes_col.find_one({"code": code})
+        if record:
+            if not is_admin:
+                gate = await group_keys_col.find_one({"chat_id": record["chat_id"], "prefix": prefix})
+                if gate:
+                    auth = await unlocked_groups_col.find_one({"user_id": user.id})
+                    auth_key = f"{record['chat_id']}_{prefix}"
+                    if not auth or auth_key not in auth.get("unlocked_prefixes", []):
+                        context.user_data['pending_unlock_group_id'] = record["chat_id"]
+                        context.user_data['pending_unlock_prefix'] = prefix
+                        context.user_data['interrupted_file_codes'] = [code]
+                        alert = await context.bot.send_message(chat_id, f"🔒 Collection '{prefix}' Locked. Enter Key:")
+                        context.user_data['alert_message_id'] = alert.message_id
+                        return
+            await execute_file_delivery(chat_id, record, context, user)
+        else:
+            await update.message.reply_text("❌ File not found.")
+            
+    elif len(args) == 3:
+        prefix = args[0].upper().strip()
+        try:
+            start = int(args[1])
+            end = int(args[2])
+        except ValueError:
+            return await update.message.reply_text("❌ START and END must be numbers.")
+            
+        target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+        cursor = codes_col.find({"code": {"$in": target_codes}}).sort("code", 1)
+        records = await cursor.to_list(length=end-start+1)
+        
+        if not records:
+            return await update.message.reply_text("❌ No files found in that range.")
+        
+        first_record_chat_id = records[0]["chat_id"]
+        if not is_admin:
+            gate = await group_keys_col.find_one({"chat_id": first_record_chat_id, "prefix": prefix})
+            if gate:
+                auth = await unlocked_groups_col.find_one({"user_id": user.id})
+                auth_key = f"{first_record_chat_id}_{prefix}"
+                if not auth or auth_key not in auth.get("unlocked_prefixes", []):
+                    context.user_data['pending_unlock_group_id'] = first_record_chat_id
+                    context.user_data['pending_unlock_prefix'] = prefix
+                    context.user_data['interrupted_file_codes'] = target_codes
+                    alert = await context.bot.send_message(chat_id, f"🔒 Collection '{prefix}' Locked. Enter Key:")
+                    context.user_data['alert_message_id'] = alert.message_id
+                    return
+                    
+        for record in records:
+            await execute_file_delivery(chat_id, record, context, user)
+            await asyncio.sleep(0.1) 
+    else:
+        await update.message.reply_text("❌ Usage:\nSingle: `/get CODE`\nRange: `/get PREFIX START END`", parse_mode="Markdown")
+
 async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fallback router for text queries made inside bot PM."""
     if not update.message or not update.message.text or codes_col is None: return
     if context.user_data.get('timezone'): return
     
     user, chat_id, text = update.effective_user, update.effective_chat.id, update.message.text.strip().upper()
     is_admin = (user.id == ADMIN_ID)
-    
-    # Check simple text lookup queries inside Private Chat
-    record = await codes_col.find_one({"code": text})
-    if record:
-        if not is_admin:
-            gate = await group_keys_col.find_one({"prefix": record.get("prefix")})
-            if gate:
-                auth = await unlocked_groups_col.find_one({"user_id": user.id})
-                if not auth or record["prefix"] not in auth.get("unlocked_prefixes", []):
-                    await update.message.reply_text("🔒 This cluster partition is restricted. Use the inline query query interface to pass keys.")
-                    return
-        try:
-            await context.bot.copy_message(chat_id=chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
-        except Exception:
-            # Fallback to direct raw file delivery if target channel message reference isn't reachable
-            if "file_id" in record:
-                if record["media_type"] == "document": await context.bot.send_document(chat_id, record["file_id"])
-                elif record["media_type"] == "audio": await context.bot.send_audio(chat_id, record["file_id"])
+    await save_user_info(user) 
 
-# --- INLINE ENGINE (INSTANT DIRECT MEDIA COPIER) ---
+    # UNLOCK LOGIC ONLY
+    pending_chat = context.user_data.get('pending_unlock_group_id')
+    pending_prefix = context.user_data.get('pending_unlock_prefix')
+    
+    if pending_chat and pending_prefix and not is_admin:
+        try: await context.bot.delete_message(chat_id, update.message.message_id)
+        except: pass
+        gate = await group_keys_col.find_one({"chat_id": pending_chat, "prefix": pending_prefix})
+        if gate and text == gate["secret_key"].upper():
+            auth_key = f"{pending_chat}_{pending_prefix}"
+            await unlocked_groups_col.update_one(
+                {"user_id": user.id}, 
+                {"$addToSet": {"unlocked_prefixes": auth_key}}, 
+                upsert=True
+            )
+            alert_id = context.user_data.pop('alert_message_id', None)
+            if alert_id: 
+                try: await context.bot.delete_message(chat_id, alert_id)
+                except: pass
+                
+            codes = context.user_data.pop('interrupted_file_codes', [])
+            context.user_data.pop('pending_unlock_group_id', None)
+            context.user_data.pop('pending_unlock_prefix', None)
+            
+            if codes:
+                cursor = codes_col.find({"code": {"$in": codes}}).sort("code", 1)
+                records = await cursor.to_list(length=len(codes))
+                for record in records:
+                    await execute_file_delivery(chat_id, record, context, user)
+        else:
+            m = await update.message.reply_text("❌ Key Denied.")
+            context.job_queue.run_once(delete_msg_callback, 10, data={"chat_id": chat_id, "message_id": m.message_id})
+        return
+
+async def execute_file_delivery(chat_id, record, context, user):
+    try:
+        copied = await context.bot.copy_message(chat_id=chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
+        await log_event(user.id, user.username, f"Requested asset: {record['code']}")
+        warn = await context.bot.send_message(chat_id, "⚠️ **ALERT**:FILE IS EPHEMERAL\nCopy the file somewhere safe\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
+        context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": copied.message_id})
+        context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
+    except Exception as e: logger.error(f"Delivery error: {e}")
+
+# --- INLINE QUERY ROUTER ---
 
 async def inline_query_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Upgraded Inline Query Handler mirroring Shazam interface metrics.
-    Delivers structural binary content instantly inside ANY chat windows context seamlessly.
-    """
-    raw_query = update.inline_query.query.strip()
-    if not raw_query or codes_col is None: return
+    query = update.inline_query.query.strip()
+    if not query.startswith("/get "): return
     
-    parts = raw_query.split()
-    search_code = parts[0].upper()
-    provided_key = parts[1] if len(parts) > 1 else None
-    
-    # Retrieve structural resource information records from our tracking manifest collection
-    record = await codes_col.find_one({"code": search_code})
-    if not record or "file_id" not in record: return
+    parts = query.split()
+    if len(parts) < 2: return
     
     user_id = update.effective_user.id
     is_admin = (user_id == ADMIN_ID)
-    prefix = record.get("prefix", search_code[:3])
     
-    # Security layer evaluation metrics
+    prefix = ""
+    target_codes = []
+    provided_pass = None
+    
+    try:
+        if len(parts) == 2 or (len(parts) == 3 and not parts[2].isdigit()):
+            code = parts[1].upper()
+            prefix = ''.join([c for c in code if c.isalpha()]) or code[:3]
+            target_codes = [code]
+            if len(parts) == 3: provided_pass = parts[2]
+            
+        elif len(parts) >= 3:
+            prefix = parts[1].upper()
+            start = int(parts[2])
+            
+            if len(parts) >= 4 and parts[3].isdigit():
+                end = int(parts[3])
+                if len(parts) == 5: provided_pass = parts[4]
+            else:
+                end = start
+                if len(parts) == 4: provided_pass = parts[3]
+                
+            target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+    except Exception:
+        return 
+        
+    if not target_codes or codes_col is None: return
+    
+    cursor = codes_col.find({"code": {"$in": target_codes}}).sort("code", 1)
+    records = await cursor.to_list(length=len(target_codes))
+    
+    if not records: return 
+    
+    first_record = records[0]
     if not is_admin:
-        gate = await group_keys_col.find_one({"prefix": prefix})
+        gate = await group_keys_col.find_one({"chat_id": first_record["chat_id"], "prefix": prefix})
         if gate:
             auth = await unlocked_groups_col.find_one({"user_id": user_id})
-            is_unlocked = auth and prefix in auth.get("unlocked_prefixes", [])
+            auth_key = f"{first_record['chat_id']}_{prefix}"
+            is_unlocked = auth and auth_key in auth.get("unlocked_prefixes", [])
             
             if not is_unlocked:
-                if provided_key and provided_key == gate["secret_key"]:
+                if provided_pass == gate["secret_key"]:
                     await unlocked_groups_col.update_one(
                         {"user_id": user_id}, 
-                        {"$addToSet": {"unlocked_prefixes": prefix}}, 
+                        {"$addToSet": {"unlocked_prefixes": auth_key}}, 
                         upsert=True
                     )
                 else:
-                    # Inform user password authentication credentials are required to display asset
-                    results = [
-                        InlineQueryResultArticle(
-                            id=str(uuid.uuid4()),
-                            title=f"🔒 Cluster {prefix} is Locked",
-                            description="Syntax: @bot CODE PASSWORD to unlock",
-                            input_message_content=InputTextMessageContent(f"⚠️ Locked partition access attempt for `{prefix}` Cluster.")
-                        )
-                    ]
-                    await update.inline_query.answer(results, cache_time=0, is_personal=True)
-                    return
-
-    file_id = record["file_id"]
-    media_type = record["media_type"]
-    title = record.get("title", f"Asset {search_code}")
-    res_id = str(uuid.uuid4())
-    
-    results = []
-    
-    # Construct instant rendering cached media container structures map references
-    try:
-        if media_type == "document":
-            results.append(InlineQueryResultCachedDocument(id=res_id, title=f"📦 {title}", document_file_id=file_id, description=f"Deliver file asset {search_code}"))
-        elif media_type == "audio":
-            results.append(InlineQueryResultCachedAudio(id=res_id, audio_file_id=file_id, caption=f"🎵 Shared via Vector Engine"))
-        elif media_type == "video":
-            results.append(InlineQueryResultCachedVideo(id=res_id, title=title, video_file_id=file_id, description="Deliver video instantly"))
-        elif media_type == "voice":
-            results.append(InlineQueryResultCachedVoice(id=res_id, title=title, voice_file_id=file_id))
-    except Exception as e:
-        logger.error(f"Failed to generate cached inline result instance wrapper: {e}")
-        return
-
-    if results:
-        await update.inline_query.answer(results, cache_time=0, is_personal=True)
+                    return 
+                    
+    if len(records) == 1:
+        clean_command = f"/get {records[0]['code']}"
+        title_text = f"📦 Fetch {records[0]['code']}"
+        desc_text = "Click to deliver to this chat."
+    else:
+        clean_command = f"/get {prefix} {int(records[0]['code'].replace(prefix, ''))} {int(records[-1]['code'].replace(prefix, ''))}"
+        title_text = f"📦 Fetch {len(records)} Files"
+        desc_text = f"Deliver {records[0]['code']} to {records[-1]['code']}"
+        
+    results = [
+        InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title=title_text,
+            description=desc_text,
+            input_message_content=InputTextMessageContent(clean_command)
+        )
+    ]
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
 # --- APP SETUP ---
 
@@ -560,7 +740,10 @@ def create_application():
     rem_conv = ConversationHandler(
         entry_points=[CommandHandler("remind", start_remind)],
         states={
-            GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)], 
+            GET_TZ_CHOICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), 
+                MessageHandler(filters.LOCATION, handle_tz_choice)
+            ], 
             GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], 
             GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)], 
             GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]
@@ -577,15 +760,16 @@ def create_application():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", start_command))
     app.add_handler(CommandHandler("list", list_reminders))
+    app.add_handler(CommandHandler("get", get_file_command)) 
     app.add_handler(CommandHandler("del", range_delete))
     app.add_handler(CommandHandler("save", save_message))
+    app.add_handler(CommandHandler("autobulk", auto_bulk_register))
     app.add_handler(CommandHandler("setkey", set_group_key))
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
     app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
     app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern="^delrem_"))
     app.add_handler(rem_conv)
-    app.add_handler(man_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
     app.add_handler(InlineQueryHandler(inline_query_manager)) 
     return app
@@ -599,7 +783,10 @@ def webhook():
     if main_loop: 
         try:
             update_data = request.get_json(force=True)
-            asyncio.run_coroutine_threadsafe(application.process_update(Update.de_json(update_data, application.bot)), main_loop)
+            asyncio.run_coroutine_threadsafe(
+                application.process_update(Update.de_json(update_data, application.bot)), 
+                main_loop
+            )
         except Exception as e:
             logger.error(f"Webhook processing error: {e}")
     return "OK"
@@ -613,6 +800,7 @@ async def main():
     
     main_loop = asyncio.get_running_loop()
     
+    # DB Cleanup/Index
     try: 
         await logs_col.create_index("timestamp", expireAfterSeconds=604800)
         await users_col.create_index("user_id", unique=True)
@@ -622,11 +810,13 @@ async def main():
     await application.initialize()
     await application.start()
     
+    # Reschedule reminders
     try:
         cursor = reminders_col.find({})
         async for r in cursor: schedule_reminder_job(application, r)
     except: pass
     
+    # Set Webhook
     try: await application.bot.set_webhook(url=f"{RENDER_URL.rstrip('/')}/{TOKEN}")
     except: pass
     
@@ -636,4 +826,5 @@ async def main():
 
 if __name__ == '__main__':
     try: asyncio.run(main())
-    except Exception as e: logger.critical(f"FATAL SHUTDOWN: {e}", exc_info=True)
+    except Exception as e:
+        logger.critical(f"FATAL SHUTDOWN: {e}", exc_info=True)
