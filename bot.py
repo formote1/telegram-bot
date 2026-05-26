@@ -529,7 +529,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Use `/get CODE` to retrieve a file.\n\nCopyright © **NurAziz**"
+        greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown\n📜 /list - Manage reminders\n📦 Use /get `CODE` to retrieve a file.\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
 
 async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
