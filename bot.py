@@ -5,9 +5,14 @@ import sys
 import json
 import threading
 import html
+import uuid
 from datetime import datetime, time, timedelta
 import pytz
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton, 
+    InlineKeyboardButton, InlineKeyboardMarkup,
+    InlineQueryResultArticle, InputTextMessageContent
+)
 from telegram.ext import (
     ApplicationBuilder, 
     ContextTypes, 
@@ -15,7 +20,8 @@ from telegram.ext import (
     MessageHandler, 
     filters, 
     ConversationHandler,
-    CallbackQueryHandler
+    CallbackQueryHandler,
+    InlineQueryHandler
 )
 from flask import Flask, request
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -192,8 +198,12 @@ async def admin_palette_msg():
         "**Database Matrix:**\n"
         "• `/save CODE` - Index message (by reply)\n"
         "• `/autobulk START END PREFIX` - Mass index\n"
+        "• `/del CODE` - Single file delete\n"
         "• `/del PREFIX START END` - Surgical range delete\n"
         "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n\n"
+        "**File Retrieval Engine:**\n"
+        "• `/get CODE` - Fetch a single specific asset\n"
+        "• `/get PREFIX START END` - Sequential range delivery\n\n"
         "**Monitoring:**\n"
         "• `/stats` - Live system audit report\n"
         "• `/export` - Full database JSON backup\n"
@@ -341,14 +351,30 @@ async def handle_manage_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 async def range_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
-    if len(context.args) < 3: return await update.message.reply_text("❌ `/del PREFIX START END`", parse_mode="Markdown")
+    args = context.args
+    if not args: 
+        return await update.message.reply_text("❌ Usage:\nSingle: `/del CODE`\nRange: `/del PREFIX START END`", parse_mode="Markdown")
+        
     try:
-        prefix, start, end = context.args[0].upper().strip(), int(context.args[1]), int(context.args[2])
-        target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
-        result = await codes_col.delete_many({"code": {"$in": target_codes}})
-        await update.message.reply_text(f"🗑️ vaporized `{result.deleted_count}` items.", parse_mode="Markdown")
-        await log_event(ADMIN_ID, "ADMIN", f"Range Del: {prefix}{start:03d}-{end:03d}")
-    except Exception as e: await update.message.reply_text(f"❌ Error: {e}")
+        if len(args) == 1:
+            code = args[0].upper().strip()
+            res = await codes_col.delete_one({"code": code})
+            if res.deleted_count > 0:
+                await update.message.reply_text(f"🗑️ vaporized `{code}`.", parse_mode="Markdown")
+                await log_event(ADMIN_ID, "ADMIN", f"Single Del: {code}")
+            else:
+                await update.message.reply_text(f"❌ `{code}` not found.")
+                
+        elif len(args) == 3:
+            prefix, start, end = args[0].upper().strip(), int(args[1]), int(args[2])
+            target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+            result = await codes_col.delete_many({"code": {"$in": target_codes}})
+            await update.message.reply_text(f"🗑️ vaporized `{result.deleted_count}` items.", parse_mode="Markdown")
+            await log_event(ADMIN_ID, "ADMIN", f"Range Del: {prefix}{start:03d}-{end:03d}")
+        else:
+            await update.message.reply_text("❌ Usage:\nSingle: `/del CODE`\nRange: `/del PREFIX START END`", parse_mode="Markdown")
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Error: {e}")
 
 async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
@@ -625,6 +651,88 @@ async def execute_file_delivery(chat_id, record, context, user):
         context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
     except Exception as e: logger.error(f"Delivery error: {e}")
 
+# --- INLINE QUERY ROUTER ---
+
+async def inline_query_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.inline_query.query.strip()
+    if not query.startswith("/get "): return
+    
+    parts = query.split()
+    if len(parts) < 2: return
+    
+    user_id = update.effective_user.id
+    is_admin = (user_id == ADMIN_ID)
+    
+    prefix = ""
+    target_codes = []
+    provided_pass = None
+    
+    try:
+        if len(parts) == 2 or (len(parts) == 3 and not parts[2].isdigit()):
+            code = parts[1].upper()
+            prefix = ''.join([c for c in code if c.isalpha()]) or code[:3]
+            target_codes = [code]
+            if len(parts) == 3: provided_pass = parts[2]
+            
+        elif len(parts) >= 3:
+            prefix = parts[1].upper()
+            start = int(parts[2])
+            
+            if len(parts) >= 4 and parts[3].isdigit():
+                end = int(parts[3])
+                if len(parts) == 5: provided_pass = parts[4]
+            else:
+                end = start
+                if len(parts) == 4: provided_pass = parts[3]
+                
+            target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+    except Exception:
+        return 
+        
+    if not target_codes or codes_col is None: return
+    
+    cursor = codes_col.find({"code": {"$in": target_codes}}).sort("code", 1)
+    records = await cursor.to_list(length=len(target_codes))
+    
+    if not records: return 
+    
+    first_record = records[0]
+    if not is_admin:
+        gate = await group_keys_col.find_one({"chat_id": first_record["chat_id"], "prefix": prefix})
+        if gate:
+            auth = await unlocked_groups_col.find_one({"user_id": user_id})
+            auth_key = f"{first_record['chat_id']}_{prefix}"
+            is_unlocked = auth and auth_key in auth.get("unlocked_prefixes", [])
+            
+            if not is_unlocked:
+                if provided_pass == gate["secret_key"]:
+                    await unlocked_groups_col.update_one(
+                        {"user_id": user_id}, 
+                        {"$addToSet": {"unlocked_prefixes": auth_key}}, 
+                        upsert=True
+                    )
+                else:
+                    return 
+                    
+    if len(records) == 1:
+        clean_command = f"/get {records[0]['code']}"
+        title_text = f"📦 Fetch {records[0]['code']}"
+        desc_text = "Click to deliver to this chat."
+    else:
+        clean_command = f"/get {prefix} {int(records[0]['code'].replace(prefix, ''))} {int(records[-1]['code'].replace(prefix, ''))}"
+        title_text = f"📦 Fetch {len(records)} Files"
+        desc_text = f"Deliver {records[0]['code']} to {records[-1]['code']}"
+        
+    results = [
+        InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title=title_text,
+            description=desc_text,
+            input_message_content=InputTextMessageContent(clean_command)
+        )
+    ]
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
+
 # --- APP SETUP ---
 
 def create_application():
@@ -662,8 +770,8 @@ def create_application():
     app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
     app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern="^delrem_"))
     app.add_handler(rem_conv)
-    app.add_handler(man_conv)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
+    app.add_handler(InlineQueryHandler(inline_query_manager)) 
     return app
 
 flask_app = Flask(__name__)
