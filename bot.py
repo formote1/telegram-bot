@@ -60,7 +60,7 @@ codes_col = db.saved_codes if db is not None else None
 group_keys_col = db.group_keys if db is not None else None
 unlocked_groups_col = db.unlocked_users if db is not None else None
 logs_col = db.system_logs if db is not None else None
-users_col = db.users if db is not None else None # New collection for user data
+users_col = db.users if db is not None else None 
 
 # Initialize TimezoneFinder once
 logger.info("Initializing TimezoneFinder...")
@@ -141,9 +141,30 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
         now = datetime.now(tz).date()
         target = datetime.strptime(data['target_date'], "%Y-%m-%d").date()
         days_left = (target - now).days
+        
         if days_left >= 0:
-            msg = f"🔔 REMINDER: {days_left} days left to '{data['label']}'!" if days_left > 0 else f"🎉 TODAY IS THE DAY: '{data['label']}'!"
+            if days_left > 0:
+                if days_left < 15:
+                    time_str = f"{days_left} day{'s' if days_left > 1 else ''}"
+                else:
+                    years = days_left // 365
+                    rem_days = days_left % 365
+                    weeks = rem_days // 7
+                    days = rem_days % 7
+                    
+                    parts = []
+                    if years > 0: parts.append(f"{years} year{'s' if years > 1 else ''}")
+                    if weeks > 0: parts.append(f"{weeks} week{'s' if weeks > 1 else ''}")
+                    if days > 0: parts.append(f"{days} day{'s' if days > 1 else ''}")
+                    
+                    time_str = " ".join(parts) if parts else "0 days"
+                    
+                msg = f"🔔 REMINDER: {time_str} left to '{data['label']}'!"
+            else:
+                msg = f"🎉 TODAY IS THE DAY: '{data['label']}'!"
+                
             await context.bot.send_message(chat_id=job.chat_id, text=msg)
+            
             if days_left == 0 and reminders_col is not None:
                 await reminders_col.delete_one({"_id": data['_id']})
                 job.schedule_removal()
@@ -172,7 +193,7 @@ async def admin_palette_msg():
         "• `/save CODE` - Index message (by reply)\n"
         "• `/autobulk START END PREFIX` - Mass index\n"
         "• `/del PREFIX START END` - Surgical range delete\n"
-        "• `/setkey PASSWORD` - Secure group partition\n\n"
+        "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n\n"
         "**Monitoring:**\n"
         "• `/stats` - Live system audit report\n"
         "• `/export` - Full database JSON backup\n"
@@ -186,7 +207,7 @@ async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     action = query.data.split('_')[1]
     if action == "stats": await get_stats(update, context)
-    elif action == "users": await get_user_directory(update, context) # New action
+    elif action == "users": await get_user_directory(update, context) 
     elif action == "export": await export_data(update, context)
     elif action == "alllists": await get_all_lists(update, context)
     elif action == "keys": await get_key_matrix(update, context)
@@ -205,15 +226,14 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "📊 **SYSTEM AUDIT REPORT**\n"
         "───────────────────\n"
-        f"📅 **Total Reminders:**   `{r_c:03d}`\n"
-        f"🔑 **Indexed Assets:**   `{c_c:03d}`\n"
-        f"🔐 **Locked Groups:**    `{k_c:03d}`\n"
-        f"📋 **Stored Logs:**      `{l_c:03d}`\n"
-        f"👤 **Unique Users:**     `{u_c:03d}`\n"
+        f"📅 **Total Reminders:** `{r_c:03d}`\n"
+        f"🔑 **Indexed Assets:** `{c_c:03d}`\n"
+        f"🔐 **Locked Prefixes:** `{k_c:03d}`\n"
+        f"📋 **Stored Logs:** `{l_c:03d}`\n"
+        f"👤 **Unique Users:** `{u_c:03d}`\n"
         "───────────────────\n"
         "*Auto-cleaning active: Logs purge every 7 days.*"
     )
-    # Add User Directory button as requested
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("👤 View User Directory", callback_data="pal_users")]])
     await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
 
@@ -262,7 +282,7 @@ async def get_key_matrix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = ["🗝️ <b>LIVE SECRET KEY MATRIX</b>\n"]
         for r in results:
             prefix, chat_id, count = r['_id']['prefix'], r['_id']['chat_id'], r['count']
-            key_record = await group_keys_col.find_one({"chat_id": chat_id})
+            key_record = await group_keys_col.find_one({"chat_id": chat_id, "prefix": prefix})
             passkey = html.escape(key_record["secret_key"] if key_record else "NO KEY SET")
             report.append(f"• <code>{prefix}</code> - {count:02d} items  =>  <code>{passkey}</code>")
         await update.effective_message.reply_text("\n".join(report), parse_mode="HTML")
@@ -351,9 +371,18 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Saved as `{code}`", parse_mode="Markdown")
 
 async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or not context.args or group_keys_col is None: return
-    await group_keys_col.update_one({"chat_id": update.effective_chat.id}, {"$set": {"secret_key": context.args[0].strip()}}, upsert=True)
-    await update.message.reply_text("🔒 Key set for this group!")
+    if update.effective_user.id != ADMIN_ID or group_keys_col is None: return
+    if len(context.args) < 2: return await update.message.reply_text("❌ Usage: `/setkey PREFIX PASSWORD`")
+    
+    prefix = context.args[0].upper().strip()
+    password = context.args[1].strip()
+    
+    await group_keys_col.update_one(
+        {"chat_id": update.effective_chat.id, "prefix": prefix}, 
+        {"$set": {"secret_key": password}}, 
+        upsert=True
+    )
+    await update.message.reply_text(f"🔒 Key set for prefix `{prefix}` in this group!")
 
 # --- REMINDERS ---
 
@@ -385,7 +414,7 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear() # Clear state for fresh start
+    context.user_data.clear() 
     kb = [["🇺🇿 Tashkent/Uzbekistan"], [KeyboardButton("📍 Share Location", request_location=True)]]
     await update.effective_message.reply_text(
         "Step 1: Timezone\nPlease select a city or share your location for precision:", 
@@ -399,10 +428,8 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if not msg: return GET_TZ_CHOICE
 
-        # Capture user info regardless of choice
         await save_user_info(user, location=msg.location)
 
-        # Robust location check
         if msg.location:
             logger.info(f"Received location update from user {user.id}")
             lat, lng = msg.location.latitude, msg.location.longitude
@@ -471,13 +498,81 @@ async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await save_user_info(user) # Basic info storage on start
+    await save_user_info(user)
     if user.id == ADMIN_ID:
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Enter an asset code (e.g. `AAA001`) to retrieve data.\n\nCopyright © **NurAziz**"
+        greet = "👋 **Welcome.**\n\n⏰ `/remind` - Set countdown\n📜 `/list` - Manage reminders\n📦 Use `/get CODE` to retrieve a file.\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
+
+async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if codes_col is None: return
+    args = context.args
+    if not args:
+        return await update.message.reply_text("❌ Usage:\nSingle: `/get CODE`\nRange: `/get PREFIX START END`", parse_mode="Markdown")
+    
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    is_admin = (user.id == ADMIN_ID)
+    
+    if len(args) == 1:
+        code = args[0].upper().strip()
+        prefix = ''.join([c for c in code if c.isalpha()]) 
+        if not prefix: prefix = code[:3] 
+        
+        record = await codes_col.find_one({"code": code})
+        if record:
+            if not is_admin:
+                gate = await group_keys_col.find_one({"chat_id": record["chat_id"], "prefix": prefix})
+                if gate:
+                    auth = await unlocked_groups_col.find_one({"user_id": user.id})
+                    auth_key = f"{record['chat_id']}_{prefix}"
+                    if not auth or auth_key not in auth.get("unlocked_prefixes", []):
+                        context.user_data['pending_unlock_group_id'] = record["chat_id"]
+                        context.user_data['pending_unlock_prefix'] = prefix
+                        context.user_data['interrupted_file_codes'] = [code]
+                        alert = await context.bot.send_message(chat_id, f"🔒 Collection '{prefix}' Locked. Enter Key:")
+                        context.user_data['alert_message_id'] = alert.message_id
+                        return
+            await execute_file_delivery(chat_id, record, context, user)
+        else:
+            await update.message.reply_text("❌ File not found.")
+            
+    elif len(args) == 3:
+        prefix = args[0].upper().strip()
+        try:
+            start = int(args[1])
+            end = int(args[2])
+        except ValueError:
+            return await update.message.reply_text("❌ START and END must be numbers.")
+            
+        target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+        cursor = codes_col.find({"code": {"$in": target_codes}}).sort("code", 1)
+        records = await cursor.to_list(length=end-start+1)
+        
+        if not records:
+            return await update.message.reply_text("❌ No files found in that range.")
+        
+        first_record_chat_id = records[0]["chat_id"]
+        if not is_admin:
+            gate = await group_keys_col.find_one({"chat_id": first_record_chat_id, "prefix": prefix})
+            if gate:
+                auth = await unlocked_groups_col.find_one({"user_id": user.id})
+                auth_key = f"{first_record_chat_id}_{prefix}"
+                if not auth or auth_key not in auth.get("unlocked_prefixes", []):
+                    context.user_data['pending_unlock_group_id'] = first_record_chat_id
+                    context.user_data['pending_unlock_prefix'] = prefix
+                    context.user_data['interrupted_file_codes'] = target_codes
+                    alert = await context.bot.send_message(chat_id, f"🔒 Collection '{prefix}' Locked. Enter Key:")
+                    context.user_data['alert_message_id'] = alert.message_id
+                    return
+                    
+        for record in records:
+            await execute_file_delivery(chat_id, record, context, user)
+            await asyncio.sleep(0.1) 
+    else:
+        await update.message.reply_text("❌ Usage:\nSingle: `/get CODE`\nRange: `/get PREFIX START END`", parse_mode="Markdown")
 
 async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text or codes_col is None: return
@@ -485,46 +580,41 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
     
     user, chat_id, text = update.effective_user, update.effective_chat.id, update.message.text.strip().upper()
     is_admin = (user.id == ADMIN_ID)
-    await save_user_info(user) # Track user activity
+    await save_user_info(user) 
 
-    # UNLOCK
-    pending = context.user_data.get('pending_unlock_group_id')
-    if pending and not is_admin:
+    # UNLOCK LOGIC ONLY
+    pending_chat = context.user_data.get('pending_unlock_group_id')
+    pending_prefix = context.user_data.get('pending_unlock_prefix')
+    
+    if pending_chat and pending_prefix and not is_admin:
         try: await context.bot.delete_message(chat_id, update.message.message_id)
         except: pass
-        gate = await group_keys_col.find_one({"chat_id": pending})
+        gate = await group_keys_col.find_one({"chat_id": pending_chat, "prefix": pending_prefix})
         if gate and text == gate["secret_key"].upper():
-            await unlocked_groups_col.update_one({"user_id": user.id}, {"$addToSet": {"unlocked_chats": pending}}, upsert=True)
+            auth_key = f"{pending_chat}_{pending_prefix}"
+            await unlocked_groups_col.update_one(
+                {"user_id": user.id}, 
+                {"$addToSet": {"unlocked_prefixes": auth_key}}, 
+                upsert=True
+            )
             alert_id = context.user_data.pop('alert_message_id', None)
             if alert_id: 
                 try: await context.bot.delete_message(chat_id, alert_id)
                 except: pass
-            code = context.user_data.pop('interrupted_file_code', None)
+                
+            codes = context.user_data.pop('interrupted_file_codes', [])
             context.user_data.pop('pending_unlock_group_id', None)
-            if code:
-                record = await codes_col.find_one({"code": code})
-                if record: await execute_file_delivery(chat_id, record, context, user)
+            context.user_data.pop('pending_unlock_prefix', None)
+            
+            if codes:
+                cursor = codes_col.find({"code": {"$in": codes}}).sort("code", 1)
+                records = await cursor.to_list(length=len(codes))
+                for record in records:
+                    await execute_file_delivery(chat_id, record, context, user)
         else:
             m = await update.message.reply_text("❌ Key Denied.")
             context.job_queue.run_once(delete_msg_callback, 10, data={"chat_id": chat_id, "message_id": m.message_id})
         return
-
-    # LOOKUP
-    record = await codes_col.find_one({"code": text})
-    if record:
-        try: await context.bot.delete_message(chat_id, update.message.message_id)
-        except: pass
-        if not is_admin:
-            gate = await group_keys_col.find_one({"chat_id": record["chat_id"]})
-            if gate:
-                auth = await unlocked_groups_col.find_one({"user_id": user.id})
-                if not auth or record["chat_id"] not in auth.get("unlocked_chats", []):
-                    context.user_data['pending_unlock_group_id'] = record["chat_id"]
-                    context.user_data['interrupted_file_code'] = text
-                    alert = await context.bot.send_message(chat_id, "🔒 Collection Locked. Enter Key:")
-                    context.user_data['alert_message_id'] = alert.message_id
-                    return
-        await execute_file_delivery(chat_id, record, context, user)
 
 async def execute_file_delivery(chat_id, record, context, user):
     try:
@@ -562,6 +652,7 @@ def create_application():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", start_command))
     app.add_handler(CommandHandler("list", list_reminders))
+    app.add_handler(CommandHandler("get", get_file_command)) 
     app.add_handler(CommandHandler("del", range_delete))
     app.add_handler(CommandHandler("save", save_message))
     app.add_handler(CommandHandler("autobulk", auto_bulk_register))
