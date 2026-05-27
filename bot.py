@@ -651,7 +651,6 @@ async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
             if msg: delivered_ids.append(msg.message_id)
             await asyncio.sleep(0.1)
         if delivered_ids:
-            # GRAMMAR FIX: 1 file vs multiple files
             count = len(delivered_ids)
             msg_text = f"⚠️ **ALERT**: FILE IS EPHEMERAL" if count == 1 else f"⚠️ **ALERT**: {count} FILES ARE EPHEMERAL"
             warn = await context.bot.send_message(chat_id, f"{msg_text}\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
@@ -672,7 +671,6 @@ async def execute_file_delivery(chat_id, record, context, user, send_alert=True)
         else: msg = await context.bot.copy_message(chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
         await log_event(user.id, user.username, f"Requested asset: {record['code']}")
         if send_alert:
-            # GRAMMAR FIX: Single file
             warn = await context.bot.send_message(chat_id, "⚠️ **ALERT**: FILE IS EPHEMERAL\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
             context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": msg.message_id})
             context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
@@ -688,7 +686,7 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
     is_admin = (user.id == ADMIN_ID)
     await save_user_info(user)
     
-    # INLINE RANGE FIX: Capture /get SOS 4 7 even from inline bot results
+    # EXCLUSIVE INLINE COMMAND LISTENER
     if text.upper().startswith("/GET "):
         parts = text.split()
         if len(parts) >= 2:
@@ -716,7 +714,6 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
                     if m: delivered_ids.append(m.message_id)
                     await asyncio.sleep(0.1)
                 if delivered_ids:
-                    # GRAMMAR FIX
                     count = len(delivered_ids)
                     msg_text = f"⚠️ **ALERT**: FILE IS EPHEMERAL" if count == 1 else f"⚠️ **ALERT**: {count} FILES ARE EPHEMERAL"
                     warn = await context.bot.send_message(chat_id, f"{msg_text}\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
@@ -769,7 +766,7 @@ async def inline_query_manager(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def create_application():
     app = ApplicationBuilder().token(TOKEN).build()
-    rem_conv = ConversationHandler(entry_points=[CommandHandler("remind", start_remind)], states={GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)], GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)], GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]}, fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))], per_message=False)
+    rem_conv = ConversationHandler(entry_points=[CommandHandler("remind", start_remind)], states={GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)], GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]}, fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))], per_message=False)
     man_conv = ConversationHandler(entry_points=[CallbackQueryHandler(manage_db_gui, pattern="^pal_manage$")], states={MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_callback, pattern="^pref_wipe_")]}, fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))], per_message=False)
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", start_command))
@@ -787,7 +784,8 @@ def create_application():
     app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern="^delrem_"))
     app.add_handler(rem_conv)
     app.add_handler(man_conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, core_routing_manager))
+    # UNIVERSAL TEXT LISTENER - Required to capture the /get text sent from inline query results
+    app.add_handler(MessageHandler(filters.TEXT, core_routing_manager))
     app.add_handler(InlineQueryHandler(inline_query_manager))
     return app
 
