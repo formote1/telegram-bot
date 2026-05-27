@@ -199,7 +199,6 @@ async def admin_palette_msg():
         [InlineKeyboardButton("🗑️ Manage DB", callback_data="pal_manage"), InlineKeyboardButton("📋 System Logs", callback_data="pal_logs")],
         [InlineKeyboardButton("🔄 Sync Metadata", callback_data="pal_sync")]
     ]
-    # FIX: Wrapped commands in backticks to prevent Markdown parsing errors (especially for underscore in rename_prefix)
     text = (
         "👑 **MASTER CONSOLE** 🔞\n"
         "───────────────────────\n"
@@ -592,11 +591,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown\n📜 /list - Manage reminders\n📦 Use /get `CODE` to retrieve a file.\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
 
-async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE, force_args=None):
     if codes_col is None: return
-    args = context.args
+    args = force_args if force_args is not None else context.args
+    chat_id = update.effective_chat.id
     if not args: return await update.message.reply_text("❌ Usage:\nSingle: `/get CODE`\nRange: `/get PREFIX START END`", parse_mode="Markdown")
-    user, chat_id = update.effective_user, update.effective_chat.id
+    user = update.effective_user
     is_admin = (user.id == ADMIN_ID)
     if len(args) == 1:
         code = args[0].upper().strip()
@@ -651,7 +651,10 @@ async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if msg: delivered_ids.append(msg.message_id)
             await asyncio.sleep(0.1)
         if delivered_ids:
-            warn = await context.bot.send_message(chat_id, f"⚠️ **ALERT**: {len(delivered_ids)} FILES ARE EPHEMERAL\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
+            # GRAMMAR FIX: 1 file vs multiple files
+            count = len(delivered_ids)
+            msg_text = f"⚠️ **ALERT**: FILE IS EPHEMERAL" if count == 1 else f"⚠️ **ALERT**: {count} FILES ARE EPHEMERAL"
+            warn = await context.bot.send_message(chat_id, f"{msg_text}\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
             for m_id in delivered_ids: context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": m_id})
             context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
 
@@ -669,6 +672,7 @@ async def execute_file_delivery(chat_id, record, context, user, send_alert=True)
         else: msg = await context.bot.copy_message(chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
         await log_event(user.id, user.username, f"Requested asset: {record['code']}")
         if send_alert:
+            # GRAMMAR FIX: Single file
             warn = await context.bot.send_message(chat_id, "⚠️ **ALERT**: FILE IS EPHEMERAL\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
             context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": msg.message_id})
             context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
@@ -683,6 +687,13 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
     user, chat_id, text = update.effective_user, update.effective_chat.id, update.message.text.strip()
     is_admin = (user.id == ADMIN_ID)
     await save_user_info(user)
+    
+    # INLINE RANGE FIX: Capture /get SOS 4 7 even from inline bot results
+    if text.upper().startswith("/GET "):
+        parts = text.split()
+        if len(parts) >= 2:
+            return await get_file_command(update, context, force_args=parts[1:])
+
     pending_chat = context.user_data.get('pending_unlock_group_id')
     pending_prefix = context.user_data.get('pending_unlock_prefix')
     if pending_chat and pending_prefix and not is_admin:
@@ -705,7 +716,10 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
                     if m: delivered_ids.append(m.message_id)
                     await asyncio.sleep(0.1)
                 if delivered_ids:
-                    warn = await context.bot.send_message(chat_id, f"⚠️ **ALERT**: {len(delivered_ids)} FILES ARE EPHEMERAL\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
+                    # GRAMMAR FIX
+                    count = len(delivered_ids)
+                    msg_text = f"⚠️ **ALERT**: FILE IS EPHEMERAL" if count == 1 else f"⚠️ **ALERT**: {count} FILES ARE EPHEMERAL"
+                    warn = await context.bot.send_message(chat_id, f"{msg_text}\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
                     for m_id in delivered_ids: context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": m_id})
                     context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
         else:
