@@ -31,6 +31,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from timezonefinder import TimezoneFinder
 from bson import ObjectId
 from werkzeug.serving import make_server
+from pyfiglet import Figlet 
+from PIL import Image
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -87,6 +89,96 @@ MANAGE_CHOOSE_PREFIX = 4
 # Global instances
 application = None
 main_loop = None
+
+# --- ASCII LOGIC (The "Gut") ---
+
+# ascii characters from dark to light
+ASCII_CHARS = [".", ",", ":", ";", "+", "*", "?", "%", "S", "#", "@"]
+
+def resize_image(image, new_width=100):
+    width, height = image.size
+    ratio = height / width / 2.2 
+    new_height = int(new_width * ratio)
+    resized_image = image.resize((new_width, new_height))
+    return resized_image
+
+def grayify(image):
+    grayscale_image = image.convert("L")
+    return grayscale_image
+
+def pixels_to_ascii(image):
+    pixels = image.getdata()
+    characters = "".join([ASCII_CHARS[pixel//25] for pixel in pixels])
+    return characters
+
+def process_image_to_ascii(image, new_width=100):
+    # convert image to ascii
+    new_image_data = pixels_to_ascii(grayify(resize_image(image, new_width)))
+
+    # format
+    pixel_count = len(new_image_data)
+    ascii_image = "\n".join(new_image_data[i:(i+new_width)] for i in range(0, pixel_count, new_width))
+    return ascii_image
+
+# --- HANDLERS ---
+
+async def ascii_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggers the ASCII conversion for text or images."""
+    message = update.effective_message
+    user = update.effective_user
+    
+    # 1. Check for text input directly in command
+    text_content = " ".join(context.args)
+    
+    # 2. Check for image (attached or replied to)
+    photo = None
+    if message.photo:
+        photo = message.photo[-1]
+    elif message.reply_to_message and message.reply_to_message.photo:
+        photo = message.reply_to_message.photo[-1]
+    
+    ascii_result = ""
+    filename = f"ascii_{uuid.uuid4().hex[:8]}.txt"
+    
+    try:
+        if photo:
+            # Image Processing
+            status_msg = await message.reply_text("⏳ Processing image...")
+            file = await context.bot.get_file(photo.file_id)
+            temp_img_path = f"temp_{filename}.jpg"
+            await file.download_to_drive(temp_img_path)
+            
+            with Image.open(temp_img_path) as img:
+                ascii_result = process_image_to_ascii(img)
+            
+            os.remove(temp_img_path)
+            await status_msg.delete()
+        elif text_content:
+            # Text Processing
+            f = Figlet(font='slant')
+            ascii_result = f.renderText(text_content)
+        else:
+            await message.reply_text("❌ Usage: Send an image with caption `/ascii`, reply to an image with `/ascii`, or use `/ascii YOUR TEXT`.")
+            return
+
+        if ascii_result:
+            with open(filename, "w") as f:
+                f.write(ascii_result)
+            
+            with open(filename, "rb") as f:
+                await message.reply_document(
+                    document=f,
+                    filename="ascii_art.txt",
+                    caption="For better visuals open the file on desktop/laptop"
+                )
+            
+            os.remove(filename)
+            await log_event(user.id, user.username, f"Generated ASCII (Type: {'Image' if photo else 'Text'})")
+            
+    except Exception as e:
+        logger.error(f"ASCII Error: {e}")
+        await message.reply_text(f"❌ Failed to generate ASCII: {e}")
+        if os.path.exists(filename): os.remove(filename)
 
 # --- UTILS & BACKGROUND WORKERS ---
 
@@ -208,7 +300,8 @@ async def admin_palette_msg():
         "**Core Commands:**\n"
         "• `/start` - Launch node / Admin Dashboard\n"
         "• `/remind` - Setup new countdown reminder\n"
-        "• `/list` - View your personal reminders\n\n"
+        "• `/list` - View your personal reminders\n"
+        "• `/ascii` - Generate ASCII art (Text/Image)\n\n"
         "**Database Matrix:**\n"
         "• `/save CODE` - Index message (by reply)\n"
         "• `/autobulk START END PREFIX` - Mass index\n"
@@ -588,7 +681,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown\n📜 /list - Manage reminders\n📦 Use /get `CODE` to retrieve a file.\n\nCopyright © **NurAziz**"
+        greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown\n📜 /list - Manage reminders\n📦 Use /get `CODE` to retrieve a file.\n🎨 Use /ascii `TEXT` or send an image with `/ascii` for ASCII art.\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
 
 async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE, force_args=None):
@@ -691,6 +784,10 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
         parts = text.split()
         if len(parts) >= 2:
             return await get_file_command(update, context, force_args=parts[1:])
+    
+    # Handle /ascii command if sent as a caption with an image or just text
+    if text.lower().startswith("/ascii"):
+        return await ascii_command_handler(update, context)
 
     pending_chat = context.user_data.get('pending_unlock_group_id')
     pending_prefix = context.user_data.get('pending_unlock_prefix')
@@ -780,12 +877,13 @@ def create_application():
     app.add_handler(CommandHandler("rename_prefix", rename_prefix))
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
+    app.add_handler(CommandHandler("ascii", ascii_command_handler))
     app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
     app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern="^delrem_"))
     app.add_handler(rem_conv)
     app.add_handler(man_conv)
-    # UNIVERSAL TEXT LISTENER - Required to capture the /get text sent from inline query results
-    app.add_handler(MessageHandler(filters.TEXT, core_routing_manager))
+    # UNIVERSAL LISTENER
+    app.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, core_routing_manager))
     app.add_handler(InlineQueryHandler(inline_query_manager))
     return app
 
