@@ -629,7 +629,7 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_user_info(user, location=msg.location)
         if msg.location:
             lat, lng = msg.location.latitude, msg.location.longitude
-            timezone_str = tf.timezone_at(lng=lng, lat=lat) if tf else "Asia/Tashkent"
+            timezone_str = tf.timezone_at(lng=lng, lat=lat) if tf else "Tashkent/Uzbekistan"
         else: timezone_str = "Tashkent/Uzbekistan"
         context.user_data['timezone'] = timezone_str
         await msg.reply_text(f"✅ Timezone set to: {timezone_str}\nStep 2: Enter target date (YYYY-MM-DD):")
