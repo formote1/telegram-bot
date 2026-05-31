@@ -630,7 +630,7 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if msg.location:
             lat, lng = msg.location.latitude, msg.location.longitude
             timezone_str = tf.timezone_at(lng=lng, lat=lat) if tf else "Asia/Tashkent"
-        else: timezone_str = "Asia/Tashkent"
+        else: timezone_str = "Tashkent/Uzbekistan"
         context.user_data['timezone'] = timezone_str
         await msg.reply_text(f"✅ Timezone set to: {timezone_str}\nStep 2: Enter target date (YYYY-MM-DD):")
         return GET_DATE
@@ -643,7 +643,7 @@ async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%Y-%m-%d")
         context.user_data['target_date'] = text
-        await update.message.reply_text("Step 3: Enter the time (HH:MM) 24h format:")
+        await update.message.reply_text("Step 3: Enter the time you want to ve reminded\n(HH:MM) 24-hour format:")
         return GET_TIME
     except ValueError:
         await update.message.reply_text("❌ Use YYYY-MM-DD format:")
