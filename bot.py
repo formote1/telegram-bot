@@ -872,7 +872,7 @@ async def finish_reminder(message, context):
 async def browse_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📺 Series", callback_data="lib_cat_series"), 
-         InlineKeyboardButton("🎬 Movies", callback_data="lib_cat_movies")]
+         InlineKeyboardButton("🎬 Movies", callback_data="lib_cat_movie")]
     ]
     text = "📂 **CONTENT LIBRARY**\n\nSelect a category to browse:"
     if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -880,7 +880,7 @@ async def browse_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_library_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    cat = query.data.split('_')[2] # series or movies
+    cat = query.data.split('_')[2] # series or movie
     
     # Analyze library using manual labels
     cursor = prefix_labels_col.find({"category": cat})
@@ -906,9 +906,9 @@ async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
     label_rec = await prefix_labels_col.find_one({"prefix": prefix})
     name = label_rec['name'] if label_rec else prefix
     
-    if cat == "movies":
+    if cat == "movie":
         keyboard = [[InlineKeyboardButton(f"🎬 Watch {name}", callback_data=f"lib_dl_{prefix}_all")]]
-        keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_movies")])
+        keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_movie")])
         await query.edit_message_text(f"🍿 **{name}**\n\nReady to watch?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     else:
         # Check for seasons
@@ -954,8 +954,8 @@ async def handle_season_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard = []
     row = []
     for i, item in enumerate(items):
-        ep_num = int(item['code'][3:])
-        row.append(InlineKeyboardButton(f"Ep {ep_num}", callback_data=f"lib_dl_{item['code']}_one"))
+        # Refined: Relative episode numbering (i + 1)
+        row.append(InlineKeyboardButton(f"Ep {i+1}", callback_data=f"lib_dl_{item['code']}_one"))
         if len(row) == 4:
             keyboard.append(row)
             row = []
