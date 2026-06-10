@@ -15,7 +15,8 @@ from telegram import (
     InlineQueryResultArticle, InputTextMessageContent,
     InlineQueryResultCachedDocument, InlineQueryResultCachedVideo,
     InlineQueryResultCachedPhoto, InlineQueryResultCachedAudio,
-    InlineQueryResultCachedVoice, InlineQueryResultCachedMpeg4Gif
+    InlineQueryResultCachedVoice, InlineQueryResultCachedMpeg4Gif,
+    ReplyKeyboardRemove
 )
 from telegram.ext import (
     ApplicationBuilder, 
@@ -73,6 +74,7 @@ group_keys_col = db.group_keys if db is not None else None
 unlocked_groups_col = db.unlocked_users if db is not None else None
 logs_col = db.system_logs if db is not None else None
 users_col = db.users if db is not None else None 
+prefix_labels_col = db.prefix_labels if db is not None else None
 
 # Initialize TimezoneFinder once
 logger.info("Initializing TimezoneFinder...")
@@ -309,6 +311,7 @@ async def admin_palette_msg():
         "• `/del CODE` - Single file delete\n"
         "• `/del PREFIX START END` - Surgical range delete\n"
         "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n"
+        "• `/setlabel PREFIX NAME` - Assign title to prefix\n"
         "• `/rename_prefix OLD NEW` - Bulk migrate prefix\n"
         "• `/refresh` - Sync missing metadata from database\n\n"
         "**File Retrieval Engine:**\n"
@@ -591,6 +594,14 @@ async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await group_keys_col.update_one({"chat_id": update.effective_chat.id, "prefix": prefix}, {"$set": {"secret_key": password}}, upsert=True)
     await update.message.reply_text(f"🔒 Key set for prefix `{prefix}` in this group!")
 
+async def set_prefix_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or prefix_labels_col is None: return
+    if len(context.args) < 2: return await update.message.reply_text("❌ Usage: `/setlabel PREFIX NAME`")
+    prefix = context.args[0].upper().strip()[:3]
+    name = " ".join(context.args[1:])
+    await prefix_labels_col.update_one({"prefix": prefix}, {"$set": {"name": name}}, upsert=True)
+    await update.message.reply_text(f"🏷️ Label set: `{prefix}` ➔ **{name}**", parse_mode="Markdown")
+
 # --- REMINDERS (GUI ENHANCED) ---
 
 def create_calendar(year=None, month=None):
@@ -636,12 +647,22 @@ def create_month_grid(year):
     markup.append([InlineKeyboardButton("Back to Calendar", callback_data=f"cal_nav_{year}_{datetime.now().month}")])
     return InlineKeyboardMarkup(markup)
 
-def create_year_grid(month):
-    start_year = datetime.now().year
+def create_year_grid(month, start_year=None):
+    if start_year is None: start_year = datetime.now().year
+    current_year = datetime.now().year
     markup = []
     for i in range(start_year, start_year + 6, 3):
-        markup.append([InlineKeyboardButton(str(j), callback_data=f"cal_nav_{j}_{month}") for j in range(i, i+3)])
-    markup.append([InlineKeyboardButton("Back to Calendar", callback_data=f"cal_nav_{start_year}_{month}")])
+        markup.append([InlineKeyboardButton(str(j), callback_data=f"cal_nav_{j}_{month}") for j in range(i, min(i+3, current_year + 51))])
+    
+    # Finite navigation for 50 years
+    nav_row = []
+    if start_year > current_year:
+        nav_row.append(InlineKeyboardButton("<<", callback_data=f"cal_view_years_{month}_{start_year-6}"))
+    if start_year + 6 <= current_year + 50:
+        nav_row.append(InlineKeyboardButton(">>", callback_data=f"cal_view_years_{month}_{start_year+6}"))
+    
+    if nav_row: markup.append(nav_row)
+    markup.append([InlineKeyboardButton("Back to Calendar", callback_data=f"cal_nav_{current_year}_{month}")])
     return InlineKeyboardMarkup(markup)
 
 def create_time_grid(hour=None):
@@ -700,13 +721,17 @@ async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     timezone_str = "Asia/Tashkent"
+    display_name = "🇺🇿 Tashkent/Uzbekistan"
     if msg.location:
         lat, lng = msg.location.latitude, msg.location.longitude
         timezone_str = tf.timezone_at(lng=lng, lat=lat) if tf else "Asia/Tashkent"
-    elif msg.text == "🇺🇿 Tashkent/Uzbekistan": timezone_str = "Asia/Tashkent"
+        display_name = timezone_str
+    elif msg.text == "🇺🇿 Tashkent/Uzbekistan":
+        timezone_str = "Asia/Tashkent"
+        display_name = "🇺🇿 Tashkent/Uzbekistan"
     
     context.user_data['timezone'] = timezone_str
-    await msg.reply_text(f"✅ Timezone: `{timezone_str}`\n\n📅 **Step 2: Target Date**\nSelect a date from the calendar:", reply_markup=create_calendar(), parse_mode="Markdown")
+    await msg.reply_text(f"✅ Timezone: `{display_name}`\n\n📅 **Step 2: Target Date**\nSelect a date from the calendar:", reply_markup=create_calendar(), parse_mode="Markdown", reply_markup_remove=ReplyKeyboardRemove())
     return GET_DATE
 
 async def date_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -720,8 +745,10 @@ async def date_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         year = data.split('_')[3]
         await query.edit_message_reply_markup(reply_markup=create_month_grid(int(year)))
     elif data.startswith("cal_view_years_"):
-        month = data.split('_')[3]
-        await query.edit_message_reply_markup(reply_markup=create_year_grid(int(month)))
+        parts = data.split('_')
+        month = parts[3]
+        start_y = int(parts[4]) if len(parts) > 4 else None
+        await query.edit_message_reply_markup(reply_markup=create_year_grid(int(month), start_y))
     elif data.startswith("date_sel_"):
         selected_date = data.split('_')[2]
         tz_str = context.user_data.get('timezone', 'UTC')
@@ -802,6 +829,91 @@ async def finish_reminder(message, context):
     context.user_data.clear()
     return ConversationHandler.END
 
+# --- LIBRARY GUI LOGIC ---
+
+async def browse_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📺 Series", callback_data="lib_cat_series"), 
+         InlineKeyboardButton("🎬 Movies", callback_data="lib_cat_movies")]
+    ]
+    text = "📂 **CONTENT LIBRARY**\n\nSelect a category to browse:"
+    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def show_library_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    cat = query.data.split('_')[2]
+    
+    # Analyze library
+    pipeline = [
+        {"$match": {"file_type": "video"}},
+        {"$project": {"prefix": {"$substr": ["$code", 0, 3]}}},
+        {"$group": {"_id": "$prefix", "count": {"$sum": 1}}}
+    ]
+    cursor = codes_col.aggregate(pipeline)
+    prefixes = await cursor.to_list(length=None)
+    
+    filtered = []
+    for p in prefixes:
+        if cat == "series" and p['count'] > 2: filtered.append(p)
+        elif cat == "movies" and p['count'] <= 2: filtered.append(p)
+    
+    if not filtered:
+        return await query.answer(f"No {cat} found.", show_alert=True)
+    
+    keyboard = []
+    for p in filtered:
+        label_rec = await prefix_labels_col.find_one({"prefix": p['_id']})
+        name = label_rec['name'] if label_rec else f"Project {p['_id']}"
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"lib_pick_{cat}_{p['_id']}_{p['count']}")])
+    
+    keyboard.append([InlineKeyboardButton("Back", callback_data="lib_back")])
+    await query.edit_message_text(f"📂 **{cat.upper()} LIST**\n\nChoose a title:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split('_')
+    cat, prefix, count = parts[2], parts[3], int(parts[4])
+    
+    label_rec = await prefix_labels_col.find_one({"prefix": prefix})
+    name = label_rec['name'] if label_rec else prefix
+    
+    if cat == "movies":
+        keyboard = [[InlineKeyboardButton(f"🎬 Watch {name}", callback_data=f"lib_dl_{prefix}_all")]]
+        keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_movies")])
+        await query.edit_message_text(f"🍿 **{name}**\n\nReady to watch?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        # Series grid
+        keyboard = []
+        cursor = codes_col.find({"code": {"$regex": f"^{prefix}"}}).sort("code", 1)
+        items = await cursor.to_list(length=None)
+        row = []
+        for i, item in enumerate(items):
+            row.append(InlineKeyboardButton(f"Ep {i+1}", callback_data=f"lib_dl_{item['code']}_one"))
+            if len(row) == 4:
+                keyboard.append(row)
+                row = []
+        if row: keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_series")])
+        await query.edit_message_text(f"📺 **{name}**\n\nSelect an episode:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def handle_library_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split('_')
+    target, mode = parts[2], parts[3]
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    
+    if mode == "all":
+        cursor = codes_col.find({"code": {"$regex": f"^{target}"}}).sort("code", 1)
+        records = await cursor.to_list(length=None)
+        for r in records: await execute_file_delivery(chat_id, r, context, user, send_alert=True)
+    else:
+        record = await codes_col.find_one({"code": target})
+        if record: await execute_file_delivery(chat_id, record, context, user, send_alert=True)
+    
+    await query.answer("Delivering...")
+
 # --- GREETING & ROUTING ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -811,14 +923,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown (GUI)\n📜 /list - Manage reminders\n📦 Use /get `CODE` to retrieve a file.\n🎨 Use /ascii `TEXT` or send an image with `/ascii` for ASCII art.\n\nCopyright © **NurAziz**"
+        greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown (GUI)\n📜 /list - Manage reminders\n📦 /get - Open Content Library\n🎨 /ascii - ASCII art\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
 
 async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE, force_args=None):
     if codes_col is None: return
     args = force_args if force_args is not None else context.args
     chat_id = update.effective_chat.id
-    if not args: return await update.message.reply_text("❌ Usage:\nSingle: `/get CODE`\nRange: `/get PREFIX START END`", parse_mode="Markdown")
+    
+    if not args:
+        return await browse_library(update, context)
+        
     user = update.effective_user
     is_admin = (user.id == ADMIN_ID)
     if len(args) == 1:
@@ -1017,12 +1132,17 @@ def create_application():
     app.add_handler(CommandHandler("autobulk", auto_bulk_register))
     app.add_handler(CommandHandler("refresh", refresh_metadata))
     app.add_handler(CommandHandler("setkey", set_group_key))
+    app.add_handler(CommandHandler("setlabel", set_prefix_label))
     app.add_handler(CommandHandler("rename_prefix", rename_prefix))
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
     app.add_handler(CommandHandler("ascii", ascii_command_handler))
     app.add_handler(CallbackQueryHandler(handle_palette_callback, pattern="^pal_"))
     app.add_handler(CallbackQueryHandler(handle_reminder_callback, pattern="^delrem_"))
+    app.add_handler(CallbackQueryHandler(browse_library, pattern="^lib_back$"))
+    app.add_handler(CallbackQueryHandler(show_library_items, pattern="^lib_cat_"))
+    app.add_handler(CallbackQueryHandler(handle_library_pick, pattern="^lib_pick_"))
+    app.add_handler(CallbackQueryHandler(handle_library_delivery, pattern="^lib_dl_"))
     app.add_handler(rem_conv)
     app.add_handler(man_conv)
     # UNIVERSAL LISTENER
@@ -1032,7 +1152,7 @@ def create_application():
 
 flask_app = Flask(__name__)
 @flask_app.route('/')
-def health(): return "Supreme Commander Node Online."
+def health(): return "Supreme Commander Pro Max Online."
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     if main_loop:
