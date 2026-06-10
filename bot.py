@@ -6,6 +6,7 @@ import json
 import threading
 import html
 import uuid
+import calendar
 from datetime import datetime, time, timedelta
 import pytz
 from telegram import (
@@ -590,7 +591,81 @@ async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await group_keys_col.update_one({"chat_id": update.effective_chat.id, "prefix": prefix}, {"$set": {"secret_key": password}}, upsert=True)
     await update.message.reply_text(f"🔒 Key set for prefix `{prefix}` in this group!")
 
-# --- REMINDERS ---
+# --- REMINDERS (GUI ENHANCED) ---
+
+def create_calendar(year=None, month=None):
+    now = datetime.now()
+    if year is None: year = now.year
+    if month is None: month = now.month
+    
+    markup = []
+    # Month/Year header (Clickable for jumps)
+    markup.append([
+        InlineKeyboardButton(calendar.month_name[month], callback_data=f"cal_view_months_{year}"),
+        InlineKeyboardButton(str(year), callback_data=f"cal_view_years_{month}")
+    ])
+    # Days of week
+    markup.append([InlineKeyboardButton(d, callback_data="ignore") for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]])
+    
+    month_calendar = calendar.monthcalendar(year, month)
+    for week in month_calendar:
+        row = []
+        for day in week:
+            if day == 0: row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+            else:
+                cb_data = f"date_sel_{year}-{month:02d}-{day:02d}"
+                row.append(InlineKeyboardButton(str(day), callback_data=cb_data))
+        markup.append(row)
+    
+    # Navigation
+    prev_m = month - 1 if month > 1 else 12
+    prev_y = year if month > 1 else year - 1
+    next_m = month + 1 if month < 12 else 1
+    next_y = year if month < 12 else year + 1
+    
+    markup.append([
+        InlineKeyboardButton("<<", callback_data=f"cal_nav_{prev_y}_{prev_m}"),
+        InlineKeyboardButton(">>", callback_data=f"cal_nav_{next_y}_{next_m}")
+    ])
+    return InlineKeyboardMarkup(markup)
+
+def create_month_grid(year):
+    markup = []
+    for i in range(1, 13, 3):
+        markup.append([InlineKeyboardButton(calendar.month_name[j], callback_data=f"cal_nav_{year}_{j}") for j in range(i, i+3)])
+    markup.append([InlineKeyboardButton("Back to Calendar", callback_data=f"cal_nav_{year}_{datetime.now().month}")])
+    return InlineKeyboardMarkup(markup)
+
+def create_year_grid(month):
+    start_year = datetime.now().year
+    markup = []
+    for i in range(start_year, start_year + 6, 3):
+        markup.append([InlineKeyboardButton(str(j), callback_data=f"cal_nav_{j}_{month}") for j in range(i, i+3)])
+    markup.append([InlineKeyboardButton("Back to Calendar", callback_data=f"cal_nav_{start_year}_{month}")])
+    return InlineKeyboardMarkup(markup)
+
+def create_time_grid(hour=None):
+    markup = []
+    if hour is None:
+        text = "Select Hour (24h):"
+        for i in range(0, 24, 4):
+            markup.append([InlineKeyboardButton(f"{j:02d}:00", callback_data=f"time_hour_{j:02d}") for j in range(i, i+4)])
+    else:
+        text = f"Selected {hour}:... now select Minute:"
+        for i in range(0, 60, 15):
+            markup.append([InlineKeyboardButton(f"{hour}:{j:02d}", callback_data=f"time_min_{hour}:{j:02d}") for j in range(i, i+15, 5)])
+        markup.append([InlineKeyboardButton("Back to Hours", callback_data="time_back_hour")])
+    return text, InlineKeyboardMarkup(markup)
+
+def create_label_buttons():
+    labels = [
+        ["🎂 Birthday", "📅 Meeting"],
+        ["📚 Exam", "💊 Medicine"],
+        ["🏃 Workout", "🛒 Shopping"],
+        ["✏️ Custom Label"]
+    ]
+    markup = [[InlineKeyboardButton(l, callback_data=f"label_sel_{l}") for l in row] for row in labels]
+    return InlineKeyboardMarkup(markup)
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if reminders_col is None: return
@@ -609,109 +684,123 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    action, r_id = query.data.split('_')
-    if action == "delrem" and reminders_col is not None:
-        await reminders_col.delete_one({"_id": ObjectId(r_id)})
-        await query.edit_message_text("❌ Reminder deleted.")
+    if query.data.startswith("delrem_"):
+        r_id = query.data.split('_')[1]
+        if reminders_col is not None:
+            await reminders_col.delete_one({"_id": ObjectId(r_id)})
+            await query.edit_message_text("❌ Reminder deleted.")
     await query.answer()
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() 
     kb = [["🇺🇿 Tashkent/Uzbekistan"], [KeyboardButton("📍 Share Location", request_location=True)]]
-    await update.effective_message.reply_text("🕒 **Step 1: Timezone**\nTo ensure your reminders are accurate, I need to know your timezone.\n\nPlease select a city below or click 'Share Location' for precision.", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
+    await update.effective_message.reply_text("🕒 **Step 1: Timezone**\nSelect your location or city:", reply_markup=ReplyKeyboardMarkup(kb, one_time_keyboard=True, resize_keyboard=True), parse_mode="Markdown")
     return GET_TZ_CHOICE
 
 async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        msg = update.effective_message
-        user = update.effective_user
-        if not msg: return GET_TZ_CHOICE
-        await save_user_info(user, location=msg.location)
-        
-        timezone_str = "Asia/Tashkent"
-        is_detected = False
-        
-        if msg.location:
-            lat, lng = msg.location.latitude, msg.location.longitude
-            timezone_str = tf.timezone_at(lng=lng, lat=lat) if tf else "Asia/Tashkent"
-            is_detected = True
-        elif msg.text == "🇺🇿 Tashkent/Uzbekistan":
-            timezone_str = "Asia/Tashkent"
-            is_detected = True
-            
-        context.user_data['timezone'] = timezone_str
-        feedback = f"✅ Timezone set to: `{timezone_str}`" if is_detected else f"ℹ️ I couldn't detect your location, so I've defaulted to `{timezone_str}`."
-        
-        today_sample = datetime.now(pytz.timezone(timezone_str)).strftime("%Y-%m-%d")
-        await msg.reply_text(f"{feedback}\n\n📅 **Step 2: Target Date**\nWhen is the big day? Enter the date in **YYYY-MM-DD** format.\n\nExample: `{today_sample}`", parse_mode="Markdown")
-        return GET_DATE
-    except Exception as e:
-        logger.error(f"TZ Choice Error: {e}")
-        context.user_data['timezone'] = "Asia/Tashkent"
-        await update.message.reply_text("⚠️ Something went wrong. Defaulting to `Asia/Tashkent`.\n\n📅 **Step 2: Target Date**\nEnter the date (YYYY-MM-DD):", parse_mode="Markdown")
-        return GET_DATE
+    msg = update.effective_message
+    timezone_str = "Asia/Tashkent"
+    if msg.location:
+        lat, lng = msg.location.latitude, msg.location.longitude
+        timezone_str = tf.timezone_at(lng=lng, lat=lat) if tf else "Asia/Tashkent"
+    elif msg.text == "🇺🇿 Tashkent/Uzbekistan": timezone_str = "Asia/Tashkent"
+    
+    context.user_data['timezone'] = timezone_str
+    await msg.reply_text(f"✅ Timezone: `{timezone_str}`\n\n📅 **Step 2: Target Date**\nSelect a date from the calendar:", reply_markup=create_calendar(), parse_mode="Markdown")
+    return GET_DATE
 
-async def handle_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    tz_str = context.user_data.get('timezone', 'UTC')
-    try:
-        target_date = datetime.strptime(text, "%Y-%m-%d").date()
+async def date_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    
+    if data.startswith("cal_nav_"):
+        _, _, y, m = data.split('_')
+        await query.edit_message_reply_markup(reply_markup=create_calendar(int(y), int(m)))
+    elif data.startswith("cal_view_months_"):
+        year = data.split('_')[3]
+        await query.edit_message_reply_markup(reply_markup=create_month_grid(int(year)))
+    elif data.startswith("cal_view_years_"):
+        month = data.split('_')[3]
+        await query.edit_message_reply_markup(reply_markup=create_year_grid(int(month)))
+    elif data.startswith("date_sel_"):
+        selected_date = data.split('_')[2]
+        tz_str = context.user_data.get('timezone', 'UTC')
+        target_date = datetime.strptime(selected_date, "%Y-%m-%d").date()
         today = datetime.now(pytz.timezone(tz_str)).date()
         
         if target_date < today:
-            await update.message.reply_text("⚠️ **Wait, that date is in the past!**\nPlease enter a future date (YYYY-MM-DD).", parse_mode="Markdown")
+            await query.answer("⚠️ Date is in the past!", show_alert=True)
             return GET_DATE
             
-        context.user_data['target_date'] = text
-        await update.message.reply_text("⏰ **Step 3: Reminder Time**\nWhat time should I remind you daily? Enter in **HH:MM** (24-hour format).\n\nExample: `09:00` or `18:30`", parse_mode="Markdown")
+        context.user_data['target_date'] = selected_date
+        text, markup = create_time_grid()
+        await query.edit_message_text(f"📅 Date: `{selected_date}`\n\n⏰ **Step 3: Reminder Time**\n{text}", reply_markup=markup, parse_mode="Markdown")
         return GET_TIME
-    except ValueError:
-        sample = datetime.now(pytz.timezone(tz_str)).strftime("%Y-%m-%d")
-        await update.message.reply_text(f"❌ **Invalid Format!**\nPlease use `YYYY-MM-DD`.\n\nExample of today: `{sample}`", parse_mode="Markdown")
-        return GET_DATE
-    except Exception as e:
-        logger.error(f"Date Handle Error: {e}")
-        await update.message.reply_text("❌ An unexpected error occurred. Please try entering the date again (YYYY-MM-DD):")
-        return GET_DATE
+    await query.answer()
+    return GET_DATE
 
-async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    try:
-        datetime.strptime(text, "%H:%M")
-        context.user_data['reminder_time'] = text
-        await update.message.reply_text("🏷️ **Step 4: Label**\nFinally, give this reminder a name (e.g., 'Exam', 'Birthday', 'Meeting').", parse_mode="Markdown")
+async def time_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    
+    if data == "time_back_hour":
+        text, markup = create_time_grid()
+        await query.edit_message_text(f"📅 Date: `{context.user_data['target_date']}`\n\n⏰ **Step 3: Reminder Time**\n{text}", reply_markup=markup, parse_mode="Markdown")
+    elif data.startswith("time_hour_"):
+        hour = data.split('_')[2]
+        text, markup = create_time_grid(hour)
+        await query.edit_message_text(f"📅 Date: `{context.user_data['target_date']}`\n\n⏰ **Step 3: Reminder Time**\n{text}", reply_markup=markup, parse_mode="Markdown")
+    elif data.startswith("time_min_"):
+        selected_time = data.split('_')[2]
+        context.user_data['reminder_time'] = selected_time
+        await query.edit_message_text(f"📅 Date: `{context.user_data['target_date']}`\n⏰ Time: `{selected_time}`\n\n🏷️ **Step 4: Label**\nSelect a category or type a custom name:", reply_markup=create_label_buttons(), parse_mode="Markdown")
         return GET_LABEL
-    except ValueError:
-        await update.message.reply_text("❌ **Invalid Time!**\nPlease use the **HH:MM** 24-hour format.\n\nExample: `14:30` (for 2:30 PM)", parse_mode="Markdown")
-        return GET_TIME
-    except Exception as e:
-        logger.error(f"Time Handle Error: {e}")
-        await update.message.reply_text("❌ An unexpected error occurred. Please try entering the time again (HH:MM):")
-        return GET_TIME
+    await query.answer()
+    return GET_TIME
 
-async def handle_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def label_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    
+    if data == "label_sel_✏️ Custom Label":
+        await query.edit_message_text("⌨️ Please **type** your custom label now:")
+        await query.answer()
+        return GET_LABEL
+    
+    label = data.replace("label_sel_", "")
+    context.user_data['label'] = label
+    return await finish_reminder(query.message, context)
+
+async def handle_label_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    label = update.message.text.strip()
+    context.user_data['label'] = label
+    return await finish_reminder(update.message, context)
+
+async def finish_reminder(message, context):
     if reminders_col is None: return ConversationHandler.END
-    try:
-        user = update.effective_user
-        label = update.message.text.strip()
-        data = {
-            "user_id": user.id, 
-            "timezone": context.user_data['timezone'], 
-            "target_date": context.user_data['target_date'], 
-            "reminder_time": context.user_data['reminder_time'], 
-            "label": label
-        }
-        res = await reminders_col.insert_one(data)
-        data['_id'] = res.inserted_id
-        schedule_reminder_job(application, data)
-        await log_event(user.id, user.username, f"Set reminder: {label}")
-        await update.message.reply_text(f"🚀 **All Set!**\nI'll remind you about **{label}** every day at {data['reminder_time']} until {data['target_date']}.", parse_mode="Markdown")
-        context.user_data.clear()
-        return ConversationHandler.END
-    except Exception as e:
-        logger.error(f"Label Handle Error: {e}")
-        await update.message.reply_text("❌ Failed to save reminder. Please try again later.")
-        return ConversationHandler.END
+    user = context._user_id 
+    u_obj = await users_col.find_one({"user_id": user}) if users_col else None
+    username = u_obj.get("username") if u_obj else "Unknown"
+    
+    data = {
+        "user_id": user, 
+        "timezone": context.user_data['timezone'], 
+        "target_date": context.user_data['target_date'], 
+        "reminder_time": context.user_data['reminder_time'], 
+        "label": context.user_data['label']
+    }
+    res = await reminders_col.insert_one(data)
+    data['_id'] = res.inserted_id
+    schedule_reminder_job(application, data)
+    
+    success_text = f"🚀 **Reminder Armed!**\n\n🏷️ Label: `{data['label']}`\n📅 Date: `{data['target_date']}`\n⏰ Time: `{data['reminder_time']}` ({data['timezone']})\n\nI'll ping you daily until the day!"
+    
+    if hasattr(message, 'edit_text'): await message.edit_text(success_text, parse_mode="Markdown")
+    else: await message.reply_text(success_text, parse_mode="Markdown")
+    
+    await log_event(user, username, f"Set GUI Reminder: {data['label']}")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 # --- GREETING & ROUTING ---
 
@@ -722,7 +811,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
-        greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown\n📜 /list - Manage reminders\n📦 Use /get `CODE` to retrieve a file.\n🎨 Use /ascii `TEXT` or send an image with `/ascii` for ASCII art.\n\nCopyright © **NurAziz**"
+        greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown (GUI)\n📜 /list - Manage reminders\n📦 Use /get `CODE` to retrieve a file.\n🎨 Use /ascii `TEXT` or send an image with `/ascii` for ASCII art.\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
 
 async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE, force_args=None):
@@ -904,18 +993,21 @@ async def inline_query_manager(update: Update, context: ContextTypes.DEFAULT_TYP
 
 def create_application():
     app = ApplicationBuilder().token(TOKEN).build()
+    
     rem_conv = ConversationHandler(
         entry_points=[CommandHandler("remind", start_remind)], 
         states={
             GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)], 
-            GET_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_date)], 
-            GET_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)], 
-            GET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label)]
+            GET_DATE: [CallbackQueryHandler(date_callback_handler, pattern="^(cal_nav_|date_sel_|cal_view_|ignore)")], 
+            GET_TIME: [CallbackQueryHandler(time_callback_handler, pattern="^(time_hour_|time_min_|time_back_hour)")], 
+            GET_LABEL: [CallbackQueryHandler(label_callback_handler, pattern="^label_sel_"), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label_text)]
         }, 
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))], 
         per_message=False
     )
+    
     man_conv = ConversationHandler(entry_points=[CallbackQueryHandler(manage_db_gui, pattern="^pal_manage$")], states={MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_callback, pattern="^pref_wipe_")]}, fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))], per_message=False)
+    
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", start_command))
     app.add_handler(CommandHandler("list", list_reminders))
