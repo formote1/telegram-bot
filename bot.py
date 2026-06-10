@@ -311,7 +311,7 @@ async def admin_palette_msg():
         "• `/del CODE` - Single file delete\n"
         "• `/del PREFIX START END` - Surgical range delete\n"
         "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n"
-        "• `/setlabel PREFIX NAME` - Assign title to prefix\n"
+        "• `/setlabel PREFIX CAT TITLE` - Assign title & category\n"
         "• `/rename_prefix OLD NEW` - Bulk migrate prefix\n"
         "• `/refresh` - Sync missing metadata from database\n\n"
         "**File Retrieval Engine:**\n"
@@ -596,11 +596,17 @@ async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_prefix_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or prefix_labels_col is None: return
-    if len(context.args) < 2: return await update.message.reply_text("❌ Usage: `/setlabel PREFIX NAME`")
+    if len(context.args) < 3: return await update.message.reply_text("❌ Usage: `/setlabel PREFIX MOVIE/SERIES NAME`")
+    
     prefix = context.args[0].upper().strip()[:3]
-    name = " ".join(context.args[1:])
-    await prefix_labels_col.update_one({"prefix": prefix}, {"$set": {"name": name}}, upsert=True)
-    await update.message.reply_text(f"🏷️ Label set: `{prefix}` ➔ **{name}**", parse_mode="Markdown")
+    category = context.args[1].upper().strip()
+    name = " ".join(context.args[2:])
+    
+    if category not in ["MOVIE", "SERIES"]:
+        return await update.message.reply_text("❌ Category must be **MOVIE** or **SERIES**.")
+        
+    await prefix_labels_col.update_one({"prefix": prefix}, {"$set": {"name": name, "category": category.lower()}}, upsert=True)
+    await update.message.reply_text(f"🏷️ Label set: `{prefix}` [{category}] ➔ **{name}**", parse_mode="Markdown")
 
 # --- REMINDERS (GUI ENHANCED) ---
 
@@ -731,7 +737,9 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_name = "🇺🇿 Tashkent/Uzbekistan"
     
     context.user_data['timezone'] = timezone_str
-    await msg.reply_text(f"✅ Timezone: `{display_name}`\n\n📅 **Step 2: Target Date**\nSelect a date from the calendar:", reply_markup=create_calendar(), parse_mode="Markdown", reply_markup_remove=ReplyKeyboardRemove())
+    # Fix: Correctly clearing keyboard with a separate confirmation message
+    await msg.reply_text(f"✅ Timezone: `{display_name}`", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+    await msg.reply_text(f"📅 **Step 2: Target Date**\nSelect a date from the calendar:", reply_markup=create_calendar(), parse_mode="Markdown")
     return GET_DATE
 
 async def date_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -842,30 +850,20 @@ async def browse_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_library_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    cat = query.data.split('_')[2]
+    cat = query.data.split('_')[2] # series or movies
     
-    # Analyze library
-    pipeline = [
-        {"$match": {"file_type": "video"}},
-        {"$project": {"prefix": {"$substr": ["$code", 0, 3]}}},
-        {"$group": {"_id": "$prefix", "count": {"$sum": 1}}}
-    ]
-    cursor = codes_col.aggregate(pipeline)
+    # Analyze library using manual labels
+    cursor = prefix_labels_col.find({"category": cat})
     prefixes = await cursor.to_list(length=None)
     
-    filtered = []
-    for p in prefixes:
-        if cat == "series" and p['count'] > 2: filtered.append(p)
-        elif cat == "movies" and p['count'] <= 2: filtered.append(p)
-    
-    if not filtered:
-        return await query.answer(f"No {cat} found.", show_alert=True)
+    if not prefixes:
+        return await query.answer(f"No {cat} mapped yet.", show_alert=True)
     
     keyboard = []
-    for p in filtered:
-        label_rec = await prefix_labels_col.find_one({"prefix": p['_id']})
-        name = label_rec['name'] if label_rec else f"Project {p['_id']}"
-        keyboard.append([InlineKeyboardButton(name, callback_data=f"lib_pick_{cat}_{p['_id']}_{p['count']}")])
+    for p in prefixes:
+        name = p['name']
+        prefix = p['prefix']
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"lib_pick_{cat}_{prefix}")])
     
     keyboard.append([InlineKeyboardButton("Back", callback_data="lib_back")])
     await query.edit_message_text(f"📂 **{cat.upper()} LIST**\n\nChoose a title:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -873,7 +871,7 @@ async def show_library_items(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     parts = query.data.split('_')
-    cat, prefix, count = parts[2], parts[3], int(parts[4])
+    cat, prefix = parts[2], parts[3]
     
     label_rec = await prefix_labels_col.find_one({"prefix": prefix})
     name = label_rec['name'] if label_rec else prefix
