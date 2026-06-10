@@ -312,6 +312,7 @@ async def admin_palette_msg():
         "• `/del PREFIX START END` - Surgical range delete\n"
         "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n"
         "• `/setlabel PREFIX CAT TITLE` - Assign title & category\n"
+        "• `/setseason PREFIX SN START END` - Map season range\n"
         "• `/rename_prefix OLD NEW` - Bulk migrate prefix\n"
         "• `/refresh` - Sync missing metadata from database\n\n"
         "**File Retrieval Engine:**\n"
@@ -608,6 +609,35 @@ async def set_prefix_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await prefix_labels_col.update_one({"prefix": prefix}, {"$set": {"name": name, "category": category.lower()}}, upsert=True)
     await update.message.reply_text(f"🏷️ Label set: `{prefix}` [{category}] ➔ **{name}**", parse_mode="Markdown")
 
+async def set_season_mapping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or prefix_labels_col is None: return
+    if len(context.args) < 4: return await update.message.reply_text("❌ Usage: `/setseason PREFIX SEASON_NUM START END`")
+    
+    try:
+        prefix = context.args[0].upper().strip()[:3]
+        sn_num = int(context.args[1])
+        start = int(context.args[2])
+        end = int(context.args[3])
+        
+        season_obj = {"num": sn_num, "start": start, "end": end}
+        
+        # Pull existing record
+        rec = await prefix_labels_col.find_one({"prefix": prefix})
+        if not rec:
+            return await update.message.reply_text(f"❌ Prefix `{prefix}` not labeled. Use `/setlabel` first.")
+            
+        seasons = rec.get("seasons", [])
+        # Remove existing if same number
+        seasons = [s for s in seasons if s["num"] != sn_num]
+        seasons.append(season_obj)
+        seasons.sort(key=lambda x: x["num"])
+        
+        await prefix_labels_col.update_one({"prefix": prefix}, {"$set": {"seasons": seasons}})
+        await update.message.reply_text(f"✅ **Season {sn_num} mapped** for `{prefix}`: Range {start:03d} to {end:03d}", parse_mode="Markdown")
+        
+    except ValueError:
+        await update.message.reply_text("❌ Season, Start, and End must be numbers.")
+
 # --- REMINDERS (GUI ENHANCED) ---
 
 def create_calendar(year=None, month=None):
@@ -881,19 +911,58 @@ async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
         keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_movies")])
         await query.edit_message_text(f"🍿 **{name}**\n\nReady to watch?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     else:
-        # Series grid
-        keyboard = []
-        cursor = codes_col.find({"code": {"$regex": f"^{prefix}"}}).sort("code", 1)
-        items = await cursor.to_list(length=None)
-        row = []
-        for i, item in enumerate(items):
-            row.append(InlineKeyboardButton(f"Ep {i+1}", callback_data=f"lib_dl_{item['code']}_one"))
-            if len(row) == 4:
-                keyboard.append(row)
-                row = []
-        if row: keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_series")])
-        await query.edit_message_text(f"📺 **{name}**\n\nSelect an episode:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        # Check for seasons
+        seasons = label_rec.get("seasons", [])
+        if seasons:
+            keyboard = []
+            for sn in seasons:
+                keyboard.append([InlineKeyboardButton(f"❄️ Season {sn['num']}", callback_data=f"lib_sn_{prefix}_{sn['num']}")])
+            keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_series")])
+            await query.edit_message_text(f"📺 **{name}**\n\nSelect a Season:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        else:
+            # Series grid (Standard)
+            keyboard = []
+            cursor = codes_col.find({"code": {"$regex": f"^{prefix}"}}).sort("code", 1)
+            items = await cursor.to_list(length=None)
+            row = []
+            for i, item in enumerate(items):
+                row.append(InlineKeyboardButton(f"Ep {i+1}", callback_data=f"lib_dl_{item['code']}_one"))
+                if len(row) == 4:
+                    keyboard.append(row)
+                    row = []
+            if row: keyboard.append(row)
+            keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_series")])
+            await query.edit_message_text(f"📺 **{name}**\n\nSelect an episode:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def handle_season_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    parts = query.data.split('_')
+    prefix, sn_num = parts[2], int(parts[3])
+    
+    label_rec = await prefix_labels_col.find_one({"prefix": prefix})
+    name = label_rec['name'] if label_rec else prefix
+    season_obj = next((s for s in label_rec['seasons'] if s['num'] == sn_num), None)
+    
+    if not season_obj: return await query.answer("Season data error.")
+    
+    # Filter episodes by range
+    start, end = season_obj['start'], season_obj['end']
+    target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
+    cursor = codes_col.find({"code": {"$in": target_codes}}).sort("code", 1)
+    items = await cursor.to_list(length=None)
+    
+    keyboard = []
+    row = []
+    for i, item in enumerate(items):
+        ep_num = int(item['code'][3:])
+        row.append(InlineKeyboardButton(f"Ep {ep_num}", callback_data=f"lib_dl_{item['code']}_one"))
+        if len(row) == 4:
+            keyboard.append(row)
+            row = []
+    if row: keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("Back to Seasons", callback_data=f"lib_pick_series_{prefix}")])
+    
+    await query.edit_message_text(f"📺 **{name}** (Season {sn_num})\n\nSelect an episode:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def handle_library_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1131,6 +1200,7 @@ def create_application():
     app.add_handler(CommandHandler("refresh", refresh_metadata))
     app.add_handler(CommandHandler("setkey", set_group_key))
     app.add_handler(CommandHandler("setlabel", set_prefix_label))
+    app.add_handler(CommandHandler("setseason", set_season_mapping))
     app.add_handler(CommandHandler("rename_prefix", rename_prefix))
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
@@ -1140,6 +1210,7 @@ def create_application():
     app.add_handler(CallbackQueryHandler(browse_library, pattern="^lib_back$"))
     app.add_handler(CallbackQueryHandler(show_library_items, pattern="^lib_cat_"))
     app.add_handler(CallbackQueryHandler(handle_library_pick, pattern="^lib_pick_"))
+    app.add_handler(CallbackQueryHandler(handle_season_pick, pattern="^lib_sn_"))
     app.add_handler(CallbackQueryHandler(handle_library_delivery, pattern="^lib_dl_"))
     app.add_handler(rem_conv)
     app.add_handler(man_conv)
