@@ -186,14 +186,14 @@ async def ascii_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
 # --- UTILS & BACKGROUND WORKERS ---
 
 def extract_file_data(message):
-    """Identifies the file type and ID from a message."""
-    if message.document: return "document", message.document.file_id, message.caption
-    if message.video: return "video", message.video.file_id, message.caption
-    if message.photo: return "photo", message.photo[-1].file_id, message.caption
-    if message.audio: return "audio", message.audio.file_id, message.caption
-    if message.voice: return "voice", message.voice.file_id, message.caption
-    if message.animation: return "animation", message.animation.file_id, message.caption
-    return None, None, None
+    """Identifies the file type, ID, caption and filename from a message."""
+    if message.document: return "document", message.document.file_id, message.caption, message.document.file_name
+    if message.video: return "video", message.video.file_id, message.caption, getattr(message.video, 'file_name', None)
+    if message.photo: return "photo", message.photo[-1].file_id, message.caption, None
+    if message.audio: return "audio", message.audio.file_id, message.caption, getattr(message.audio, 'file_name', None)
+    if message.voice: return "voice", message.voice.file_id, message.caption, None
+    if message.animation: return "animation", message.animation.file_id, message.caption, getattr(message.animation, 'file_name', None)
+    return None, None, None, None
 
 async def log_event(user_id, username, action):
     if logs_col is None: return
@@ -530,7 +530,7 @@ async def rename_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def refresh_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
-    query_filter = {"$or": [{"file_id": {"$exists": False}}, {"file_id": None}, {"file_id": ""}]}
+    query_filter = {"$or": [{"file_id": {"$exists": False}}, {"file_id": None}, {"file_id": ""}, {"file_name": {"$exists": False}}]}
     total_to_sync = await codes_col.count_documents(query_filter)
     if total_to_sync == 0:
         return await update.effective_message.reply_text("✅ All assets are already synced with metadata.")
@@ -540,10 +540,10 @@ async def refresh_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async for record in cursor:
         try:
             probe = await context.bot.forward_message(chat_id=ADMIN_ID, from_chat_id=record["chat_id"], message_id=record["message_id"])
-            f_type, f_id, caption = extract_file_data(probe)
+            f_type, f_id, caption, f_name = extract_file_data(probe)
             await probe.delete()
             if f_id:
-                await codes_col.update_one({"_id": record["_id"]}, {"$set": {"file_type": f_type, "file_id": f_id, "caption": caption or ""}})
+                await codes_col.update_one({"_id": record["_id"]}, {"$set": {"file_type": f_type, "file_id": f_id, "caption": caption or "", "file_name": f_name or ""}})
                 count += 1
             if (count % 5 == 0) or count == total_to_sync:
                 await status_msg.edit_text(f"🔄 **Syncing Metadata...**\nProgress: `{count}/{total_to_sync}` updated.", parse_mode="Markdown")
@@ -566,11 +566,11 @@ async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for m_id in range(start_id, end_id + 1):
             try:
                 probe = await context.bot.forward_message(chat_id=ADMIN_ID, from_chat_id=update.effective_chat.id, message_id=m_id)
-                f_type, f_id, caption = extract_file_data(probe)
+                f_type, f_id, caption, f_name = extract_file_data(probe)
                 await probe.delete()
                 if f_id:
                     code_to_save = f"{prefix}{curr:03d}"
-                    await codes_col.update_one({"code": code_to_save}, {"$set": {"chat_id": update.effective_chat.id, "message_id": m_id, "file_type": f_type, "file_id": f_id, "caption": caption or ""}}, upsert=True)
+                    await codes_col.update_one({"code": code_to_save}, {"$set": {"chat_id": update.effective_chat.id, "message_id": m_id, "file_type": f_type, "file_id": f_id, "caption": caption or "", "file_name": f_name or ""}}, upsert=True)
                     indexed_count += 1
                     curr += 1
             except: continue
@@ -581,9 +581,9 @@ async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message or not context.args or codes_col is None: return
     code = context.args[0].upper().strip()
-    f_type, f_id, caption = extract_file_data(update.message.reply_to_message)
+    f_type, f_id, caption, f_name = extract_file_data(update.message.reply_to_message)
     if not f_id: return await update.message.reply_text("❌ No recognizable file found in the replied message.")
-    data = {"chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id, "file_type": f_type, "file_id": f_id, "caption": caption or ""}
+    data = {"chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id, "file_type": f_type, "file_id": f_id, "caption": caption or "", "file_name": f_name or ""}
     await codes_col.update_one({"code": code}, {"$set": data}, upsert=True)
     await update.message.reply_text(f"✅ Indexed `{code}` (Type: {f_type})")
 
@@ -777,12 +777,15 @@ async def date_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     
     if data.startswith("cal_nav_"):
+        await query.answer()
         _, _, y, m = data.split('_')
         await query.edit_message_reply_markup(reply_markup=create_calendar(int(y), int(m)))
     elif data.startswith("cal_view_months_"):
+        await query.answer()
         year = data.split('_')[3]
         await query.edit_message_reply_markup(reply_markup=create_month_grid(int(year)))
     elif data.startswith("cal_view_years_"):
+        await query.answer()
         parts = data.split('_')
         month = parts[3]
         start_y = int(parts[4]) if len(parts) > 4 else None
@@ -797,31 +800,14 @@ async def date_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("⚠️ Date is in the past!", show_alert=True)
             return GET_DATE
             
+        await query.answer()
         context.user_data['target_date'] = selected_date
         context.user_data['reminder_time'] = "00:01"
         await query.edit_message_text(f"📅 Date: `{selected_date}`\n⏰ Time: `00:01` (Default)\n\n🏷️ **Step 3: Label**\nSelect a category or type a custom name:", reply_markup=create_label_buttons(), parse_mode="Markdown")
         return GET_LABEL
-    await query.answer()
+    else:
+        await query.answer()
     return GET_DATE
-
-async def time_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    
-    if data == "time_back_hour":
-        text, markup = create_time_grid()
-        await query.edit_message_text(f"📅 Date: `{context.user_data['target_date']}`\n\n⏰ **Step 3: Reminder Time**\n{text}", reply_markup=markup, parse_mode="Markdown")
-    elif data.startswith("time_hour_"):
-        hour = data.split('_')[2]
-        text, markup = create_time_grid(hour)
-        await query.edit_message_text(f"📅 Date: `{context.user_data['target_date']}`\n\n⏰ **Step 3: Reminder Time**\n{text}", reply_markup=markup, parse_mode="Markdown")
-    elif data.startswith("time_min_"):
-        selected_time = data.split('_')[2]
-        context.user_data['reminder_time'] = selected_time
-        await query.edit_message_text(f"📅 Date: `{context.user_data['target_date']}`\n⏰ Time: `{selected_time}`\n\n🏷️ **Step 4: Label**\nSelect a category or type a custom name:", reply_markup=create_label_buttons(), parse_mode="Markdown")
-        return GET_LABEL
-    await query.answer()
-    return GET_TIME
 
 async def label_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -834,6 +820,7 @@ async def label_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     label = data.replace("label_sel_", "")
     context.user_data['label'] = label
+    await query.answer()
     return await finish_reminder(query.message, context, update.effective_user.id)
 
 async def handle_label_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -911,7 +898,8 @@ async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
         items = await cursor.to_list(length=None)
         keyboard = []
         for item in items:
-            label = item.get("caption", "").strip() or item["code"]
+            # Show actual filename if available
+            label = item.get("file_name") or item.get("caption", "").strip() or item["code"]
             if len(label) > 40: label = label[:37] + "..."
             keyboard.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"lib_dl_{item['code']}_one")])
         keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_movie")])
@@ -1187,7 +1175,6 @@ def create_application():
         states={
             GET_TZ_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tz_choice), MessageHandler(filters.LOCATION, handle_tz_choice)], 
             GET_DATE: [CallbackQueryHandler(date_callback_handler, pattern="^(cal_nav_|date_sel_|cal_view_|ignore)")], 
-            GET_TIME: [CallbackQueryHandler(time_callback_handler, pattern="^(time_hour_|time_min_|time_back_hour)")], 
             GET_LABEL: [CallbackQueryHandler(label_callback_handler, pattern="^label_sel_"), MessageHandler(filters.TEXT & ~filters.COMMAND, handle_label_text)]
         }, 
         fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))], 
