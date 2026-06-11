@@ -798,9 +798,9 @@ async def date_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
             return GET_DATE
             
         context.user_data['target_date'] = selected_date
-        text, markup = create_time_grid()
-        await query.edit_message_text(f"📅 Date: `{selected_date}`\n\n⏰ **Step 3: Reminder Time**\n{text}", reply_markup=markup, parse_mode="Markdown")
-        return GET_TIME
+        context.user_data['reminder_time'] = "00:01"
+        await query.edit_message_text(f"📅 Date: `{selected_date}`\n⏰ Time: `00:01` (Default)\n\n🏷️ **Step 3: Label**\nSelect a category or type a custom name:", reply_markup=create_label_buttons(), parse_mode="Markdown")
+        return GET_LABEL
     await query.answer()
     return GET_DATE
 
@@ -834,16 +834,16 @@ async def label_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     label = data.replace("label_sel_", "")
     context.user_data['label'] = label
-    return await finish_reminder(query.message, context)
+    return await finish_reminder(query.message, context, update.effective_user.id)
 
 async def handle_label_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = update.message.text.strip()
     context.user_data['label'] = label
-    return await finish_reminder(update.message, context)
+    return await finish_reminder(update.message, context, update.effective_user.id)
 
-async def finish_reminder(message, context):
+async def finish_reminder(message, context, user_id):
     if reminders_col is None: return ConversationHandler.END
-    user = context._user_id 
+    user = user_id
     u_obj = await users_col.find_one({"user_id": user}) if users_col else None
     username = u_obj.get("username") if u_obj else "Unknown"
     
@@ -907,9 +907,15 @@ async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
     name = label_rec['name'] if label_rec else prefix
     
     if cat == "movie":
-        keyboard = [[InlineKeyboardButton(f"🎬 Watch {name}", callback_data=f"lib_dl_{prefix}_all")]]
+        cursor = codes_col.find({"code": {"$regex": f"^{prefix}"}}).sort("code", 1)
+        items = await cursor.to_list(length=None)
+        keyboard = []
+        for item in items:
+            label = item.get("caption", "").strip() or item["code"]
+            if len(label) > 40: label = label[:37] + "..."
+            keyboard.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"lib_dl_{item['code']}_one")])
         keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_movie")])
-        await query.edit_message_text(f"🍿 **{name}**\n\nReady to watch?", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        await query.edit_message_text(f"🍿 **{name}**\n\nSelect a version to watch:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     else:
         # Check for seasons
         seasons = label_rec.get("seasons", [])
