@@ -765,7 +765,7 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     if query.data.startswith("delrem_"):
         r_id = query.data.split('_')[1]
-        if reminders_col is not None:
+        if reminders_col is None:
             await reminders_col.delete_one({"_id": ObjectId(r_id)})
             await query.edit_message_text("❌ Reminder deleted.")
     await query.answer()
@@ -869,8 +869,12 @@ async def finish_reminder(message, context, user_id):
     
     success_text = f"🚀 **Reminder Armed!**\n\n🏷️ Label: `{data['label']}`\n📅 Date: `{data['target_date']}`\n⏰ Time: `{data['reminder_time']}` ({data['timezone']})\n\nI'll ping you daily until the day!"
     
-    if hasattr(message, 'edit_text'): await message.edit_text(success_text, parse_mode="Markdown")
-    else: await message.reply_text(success_text, parse_mode="Markdown")
+    # Surgical Fix: Only edit if the message was sent by the bot (callback query)
+    # If the message is from the user (text label), we MUST use reply_text
+    if message.from_user.id == context.bot.id:
+        await message.edit_text(success_text, parse_mode="Markdown")
+    else:
+        await message.reply_text(success_text, parse_mode="Markdown")
     
     await log_event(user, username, f"Set GUI Reminder: {data['label']}")
     context.user_data.clear()
