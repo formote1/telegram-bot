@@ -313,6 +313,8 @@ async def admin_palette_msg():
         "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n"
         "• `/setlabel PREFIX CAT TITLE` - Assign title & category\n"
         "• `/setseason PREFIX SN START END` - Map season range\n"
+        "• `/delseason PREFIX SN` - Delete specific season\n"
+        "• `/clearseasons PREFIX` - Wipe all seasons\n"
         "• `/rename_prefix OLD NEW` - Bulk migrate prefix\n"
         "• `/refresh` - Sync missing metadata from database\n\n"
         "**File Retrieval Engine:**\n"
@@ -637,6 +639,26 @@ async def set_season_mapping(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     except ValueError:
         await update.message.reply_text("❌ Season, Start, and End must be numbers.")
+
+async def delete_season_mapping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or prefix_labels_col is None: return
+    if len(context.args) < 2: return await update.message.reply_text("❌ Usage: `/delseason PREFIX SEASON_NUM`")
+    try:
+        prefix = context.args[0].upper().strip()[:3]
+        sn_num = int(context.args[1])
+        rec = await prefix_labels_col.find_one({"prefix": prefix})
+        if not rec or "seasons" not in rec: return await update.message.reply_text(f"❌ No seasons found for `{prefix}`.")
+        seasons = [s for s in rec["seasons"] if s["num"] != sn_num]
+        await prefix_labels_col.update_one({"prefix": prefix}, {"$set": {"seasons": seasons}})
+        await update.message.reply_text(f"🗑️ Season {sn_num} deleted for `{prefix}`.")
+    except: await update.message.reply_text("❌ Season number must be an integer.")
+
+async def clear_all_seasons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or prefix_labels_col is None: return
+    if not context.args: return await update.message.reply_text("❌ Usage: `/clearseasons PREFIX`")
+    prefix = context.args[0].upper().strip()[:3]
+    await prefix_labels_col.update_one({"prefix": prefix}, {"$unset": {"seasons": ""}})
+    await update.message.reply_text(f"🔥 All seasons wiped for `{prefix}`. Ready for re-assignment.")
 
 # --- REMINDERS (GUI ENHANCED) ---
 
@@ -1194,6 +1216,8 @@ def create_application():
     app.add_handler(CommandHandler("setkey", set_group_key))
     app.add_handler(CommandHandler("setlabel", set_prefix_label))
     app.add_handler(CommandHandler("setseason", set_season_mapping))
+    app.add_handler(CommandHandler("delseason", delete_season_mapping))
+    app.add_handler(CommandHandler("clearseasons", clear_all_seasons))
     app.add_handler(CommandHandler("rename_prefix", rename_prefix))
     app.add_handler(CommandHandler("stats", get_stats))
     app.add_handler(CommandHandler("export", export_data))
