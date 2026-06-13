@@ -15,7 +15,7 @@ from telegram import (
     InlineQueryResultArticle, InputTextMessageContent,
     InlineQueryResultCachedDocument, InlineQueryResultCachedVideo,
     InlineQueryResultCachedPhoto, InlineQueryResultCachedAudio,
-    InlineQueryResultCachedVoice, InlineQueryResultCachedMpeg4Gif,
+    InlineQueryResultCachedValue, InlineQueryResultCachedVoice, InlineQueryResultCachedMpeg4Gif,
     ReplyKeyboardRemove
 )
 from telegram.ext import (
@@ -237,7 +237,7 @@ async def delete_msg_callback(context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Cleanup note: {e}")
 
 def schedule_reminder_job(app, reminder_data):
-    if not app.job_queue: return
+    if not app or not app.job_queue: return
     try:
         user_tz = pytz.timezone(reminder_data['timezone'])
         h, m = map(int, reminder_data['reminder_time'].split(':'))
@@ -765,7 +765,7 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     if query.data.startswith("delrem_"):
         r_id = query.data.split('_')[1]
-        if reminders_col is None:
+        if reminders_col is not None:
             await reminders_col.delete_one({"_id": ObjectId(r_id)})
             await query.edit_message_text("❌ Reminder deleted.")
     await query.answer()
@@ -851,34 +851,54 @@ async def handle_label_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await finish_reminder(update.message, context, update.effective_user.id)
 
 async def finish_reminder(message, context, user_id):
-    if reminders_col is None: return ConversationHandler.END
-    user = user_id
-    u_obj = await users_col.find_one({"user_id": user}) if users_col else None
-    username = u_obj.get("username") if u_obj else "Unknown"
-    
-    data = {
-        "user_id": user, 
-        "timezone": context.user_data['timezone'], 
-        "target_date": context.user_data['target_date'], 
-        "reminder_time": context.user_data['reminder_time'], 
-        "label": context.user_data['label']
-    }
-    res = await reminders_col.insert_one(data)
-    data['_id'] = res.inserted_id
-    schedule_reminder_job(application, data)
-    
-    success_text = f"🚀 **Reminder Armed!**\n\n🏷️ Label: `{data['label']}`\n📅 Date: `{data['target_date']}`\n⏰ Time: `{data['reminder_time']}` ({data['timezone']})\n\nI'll ping you daily until the day!"
-    
-    # Surgical Fix: Only edit if the message was sent by the bot (callback query)
-    # If the message is from the user (text label), we MUST use reply_text
-    if message.from_user.id == context.bot.id:
-        await message.edit_text(success_text, parse_mode="Markdown")
-    else:
-        await message.reply_text(success_text, parse_mode="Markdown")
-    
-    await log_event(user, username, f"Set GUI Reminder: {data['label']}")
-    context.user_data.clear()
-    return ConversationHandler.END
+    """Bulletproof reminder finalization with guaranteed state cleanup."""
+    try:
+        if reminders_col is None: return ConversationHandler.END
+        user = user_id
+        u_obj = await users_col.find_one({"user_id": user}) if users_col else None
+        username = u_obj.get("username") if u_obj else "Unknown"
+        
+        # Verify required keys exist
+        req = ['timezone', 'target_date', 'reminder_time', 'label']
+        if not all(k in context.user_data for k in req):
+            logger.error(f"Missing context data: {context.user_data.keys()}")
+            await message.reply_text("❌ Session error: Missing required information. Please try /remind again.")
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        data = {
+            "user_id": user, 
+            "timezone": context.user_data['timezone'], 
+            "target_date": context.user_data['target_date'], 
+            "reminder_time": context.user_data['reminder_time'], 
+            "label": context.user_data['label']
+        }
+        res = await reminders_col.insert_one(data)
+        data['_id'] = res.inserted_id
+        
+        # Safe Job Scheduling
+        if application: schedule_reminder_job(application, data)
+        
+        success_text = f"🚀 **Reminder Armed!**\n\n🏷️ Label: `{data['label']}`\n📅 Date: `{data['target_date']}`\n⏰ Time: `{data['reminder_time']}` ({data['timezone']})\n\nI'll ping you daily until the day!"
+        
+        # Robust Message Delivery
+        is_bot_msg = message.from_user.is_bot if message.from_user else False
+        if is_bot_msg:
+            try: await message.edit_text(success_text, parse_mode="Markdown")
+            except: await message.reply_text(success_text, parse_mode="Markdown")
+        else:
+            await message.reply_text(success_text, parse_mode="Markdown")
+        
+        await log_event(user, username, f"Set GUI Reminder: {data['label']}")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    except Exception as e:
+        logger.error(f"CRITICAL FINISH ERROR: {e}", exc_info=True)
+        try: await message.reply_text(f"❌ System Error: {e}")
+        except: pass
+        context.user_data.clear()
+        return ConversationHandler.END
 
 # --- LIBRARY GUI LOGIC ---
 
