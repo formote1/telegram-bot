@@ -15,7 +15,7 @@ from telegram import (
     InlineQueryResultArticle, InputTextMessageContent,
     InlineQueryResultCachedDocument, InlineQueryResultCachedVideo,
     InlineQueryResultCachedPhoto, InlineQueryResultCachedAudio,
-    InlineQueryResultCachedValue, InlineQueryResultCachedVoice, InlineQueryResultCachedMpeg4Gif,
+    InlineQueryResultCachedVoice, InlineQueryResultCachedMpeg4Gif,
     ReplyKeyboardRemove
 )
 from telegram.ext import (
@@ -304,7 +304,7 @@ async def admin_palette_msg():
         "• `/start` - Launch node / Admin Dashboard\n"
         "• `/remind` - Setup new countdown reminder\n"
         "• `/list` - View your personal reminders\n"
-        "• `/ascii` - Generate ASCII art (Text/Image)\n\n"
+        "• `/ascii` - View generated ASCII art (Text/Image)\n\n"
         "**Database Matrix:**\n"
         "• `/save CODE` - Index message (by reply)\n"
         "• `/autobulk START END PREFIX` - Mass index\n"
