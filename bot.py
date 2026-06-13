@@ -93,6 +93,21 @@ MANAGE_CHOOSE_PREFIX = 4
 application = None
 main_loop = None
 
+# --- ADMIN SENTINEL (Notifications) ---
+
+async def notify_admin(context, text, silent=False):
+    """Surgical notification system for the Admin."""
+    if not ADMIN_ID or not context: return
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=text,
+            parse_mode="Markdown",
+            disable_notification=silent
+        )
+    except Exception as e:
+        logger.error(f"Sentinel Notification Failure: {e}")
+
 # --- ASCII LOGIC (The "Gut") ---
 
 # ascii characters from dark to light
@@ -177,11 +192,13 @@ async def ascii_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
             
             os.remove(filename)
             await log_event(user.id, user.username, f"Generated ASCII (Type: {'Image' if photo else 'Text'})")
+            await notify_admin(context, f"🎨 **ASCII Success**: User `{user.id}` generated art.", silent=True)
             
     except Exception as e:
         logger.error(f"ASCII Error: {e}")
         await message.reply_text(f"❌ Failed to generate ASCII: {e}")
         if os.path.exists(filename): os.remove(filename)
+        await notify_admin(context, f"⚠️ **ASCII Error**: `{e}`")
 
 # --- UTILS & BACKGROUND WORKERS ---
 
@@ -258,32 +275,43 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
         
         if days_left >= 0:
             if days_left > 0:
-                if days_left < 15:
-                    time_str = f"{days_left} day{'s' if days_left > 1 else ''}"
-                else:
-                    years = days_left // 365
-                    rem_days = days_left % 365
-                    weeks = rem_days // 7
-                    days = rem_days % 7
-                    
-                    parts = []
-                    if years > 0: parts.append(f"{years} year{'s' if years > 1 else ''}")
-                    if weeks > 0: parts.append(f"{weeks} week{'s' if weeks > 1 else ''}")
-                    if days > 0: parts.append(f"{days} day{'s' if days > 1 else ''}")
-                    
+                # Surgical Upgrade: Chronos Logic
+                years = days_left // 365
+                rem_days = days_left % 365
+                
+                months = rem_days // 30
+                rem_days %= 30
+                
+                weeks = rem_days // 7
+                days = rem_days % 7
+                
+                parts = []
+                if years > 0: parts.append(f"{years} year{'s' if years > 1 else ''}")
+                if months > 0: parts.append(f"{months} month{'s' if months > 1 else ''}")
+                if weeks > 0: parts.append(f"{weeks} week{'s' if weeks > 1 else ''}")
+                if days > 0: parts.append(f"{days} day{'s' if days > 1 else ''}")
+                
+                # Handling "less than 1 month" explicitly as requested
+                if months == 0 and years == 0:
+                    # Logic: If under 1 month, parts only contains weeks/days
                     time_str = " ".join(parts) if parts else "0 days"
+                else:
+                    time_str = ", ".join(parts) if parts else "0 days"
                     
                 msg = f"🔔 REMINDER: {time_str} left to '{data['label']}'!"
             else:
                 msg = f"🎉 TODAY IS THE DAY: '{data['label']}'!"
                 
             await context.bot.send_message(chat_id=job.chat_id, text=msg)
+            await notify_admin(context, f"✅ **Reminder Success**: Delivered to `{job.chat_id}` for `{data['label']}`.", silent=True)
             
             if days_left == 0 and reminders_col is not None:
                 await reminders_col.delete_one({"_id": data['_id']})
                 job.schedule_removal()
         else: job.schedule_removal()
-    except Exception as e: logger.error(f"Reminder error: {e}")
+    except Exception as e:
+        logger.error(f"Reminder error: {e}")
+        await notify_admin(context, f"🔴 **REMINDER FAILURE**: `{e}` for User `{data.get('user_id')}`")
 
 # --- MASTER CONSOLE & ADMIN OPS ---
 
@@ -342,7 +370,7 @@ async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_
     elif action == "manage": 
         context.user_data.clear()
         await manage_db_gui(update, context)
-        await query.delete_message()
+        # Fix: Not deleting palette so user can navigate back
     await query.answer()
 
 async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,25 +479,39 @@ async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.remove(file_path)
 
 async def manage_db_gui(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if codes_col is None: return ConversationHandler.END
+    if codes_col is None: return
     pipeline = [{"$project": {"prefix": {"$substr": ["$code", 0, 3]}}}, {"$group": {"_id": "$prefix", "count": {"$sum": 1}}}]
     cursor = codes_col.aggregate(pipeline)
     prefixes = await cursor.to_list(length=100)
     if not prefixes: 
         await update.effective_message.reply_text("Database empty.")
-        return ConversationHandler.END
-    keyboard = [[InlineKeyboardButton(f"Wipe {p['_id']} ({p['count']} items)", callback_data=f"pref_wipe_{p['_id']}")] for p in prefixes]
-    await update.effective_message.reply_text("🗑️ Select Prefix to WIPE ENTIRELY:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return MANAGE_CHOOSE_PREFIX
+        return
+    keyboard = [[InlineKeyboardButton(f"🔥 Wipe {p['_id']} ({p['count']} items)", callback_data=f"pref_wipe_{p['_id']}")] for p in prefixes]
+    keyboard.append([InlineKeyboardButton("🔙 Back to Console", callback_data="pal_stats")])
+    await update.effective_message.reply_text("🗑️ **NUKE SELECTOR**\nChoose prefix to vaporize:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def handle_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Refactored Nuke Callback: Direct and Surgical."""
     query = update.callback_query
     await query.answer()
     prefix = query.data.split('_')[2]
-    await codes_col.delete_many({"code": {"$regex": f"^{prefix}"}})
-    await query.edit_message_text(f"🔥 **NUKE COMPLETE:** `{prefix}` vaporized.", parse_mode="Markdown")
-    await log_event(ADMIN_ID, "ADMIN", f"Full Wipe: {prefix}")
-    return ConversationHandler.END
+    
+    try:
+        # 1. Surgical Count
+        count_to_wipe = await codes_col.count_documents({"code": {"$regex": f"^{prefix}"}})
+        
+        # 2. Vaporize
+        res = await codes_col.delete_many({"code": {"$regex": f"^{prefix}"}})
+        await prefix_labels_col.delete_one({"prefix": prefix})
+        
+        # 3. Report
+        msg = f"🔥 **NUKE COMPLETE**\nPrefix `{prefix}` vaporized.\nAssets Deleted: `{res.deleted_count}/{count_to_wipe}`"
+        await query.edit_message_text(msg, parse_mode="Markdown")
+        await log_event(ADMIN_ID, "ADMIN", f"Nuke Success: {prefix}")
+        await notify_admin(context, f"☢️ **SENTINEL ALERT**: Nuke triggered for `{prefix}`. `{res.deleted_count}` items erased.")
+    except Exception as e:
+        await query.edit_message_text(f"❌ **NUKE FAILED**: `{e}`", parse_mode="Markdown")
+        await notify_admin(context, f"🔴 **NUKE FAILURE**: Error wiping `{prefix}`: `{e}`")
 
 async def range_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
@@ -484,6 +526,7 @@ async def range_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if res.deleted_count > 0:
                 await update.message.reply_text(f"🗑️ vaporized `{code}`.", parse_mode="Markdown")
                 await log_event(ADMIN_ID, "ADMIN", f"Single Del: {code}")
+                await notify_admin(context, f"🗑️ **Silent Log**: Admin deleted `{code}`.", silent=True)
             else:
                 await update.message.reply_text(f"❌ `{code}` not found.")
                 
@@ -493,10 +536,12 @@ async def range_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await codes_col.delete_many({"code": {"$in": target_codes}})
             await update.message.reply_text(f"🗑️ vaporized `{result.deleted_count}` items.", parse_mode="Markdown")
             await log_event(ADMIN_ID, "ADMIN", f"Range Del: {prefix}{start:03d}-{end:03d}")
+            await notify_admin(context, f"🗑️ **Silent Log**: Range Delete for `{prefix}` ({result.deleted_count} items).", silent=True)
         else:
             await update.message.reply_text("❌ Usage:\nSingle: `/del CODE`\nRange: `/del PREFIX START END`", parse_mode="Markdown")
     except Exception as e: 
         await update.message.reply_text(f"❌ Error: {e}")
+        await notify_admin(context, f"🔴 **DEL FAILURE**: `{e}`")
 
 async def rename_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
@@ -526,9 +571,11 @@ async def rename_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await status.edit_text(f"✅ **Migration Complete!**\nMoved `{count}` items from `{old_prefix}` to `{new_prefix}`.", parse_mode="Markdown")
         await log_event(ADMIN_ID, "ADMIN", f"Rename Prefix: {old_prefix} -> {new_prefix} ({count} items)")
+        await notify_admin(context, f"🔄 **Silent Log**: Migrated `{old_prefix}` to `{new_prefix}` ({count} items).", silent=True)
     except Exception as e:
         logger.error(f"Rename error: {e}")
         await status.edit_text(f"❌ **Migration Failed:** {e}")
+        await notify_admin(context, f"🔴 **RENAME FAILURE**: `{e}`")
 
 async def refresh_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
@@ -555,6 +602,7 @@ async def refresh_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
     await status_msg.edit_text(f"✅ **Sync Phase Finalized!**\nSuccessfully updated `{count}` assets.", parse_mode="Markdown")
     await log_event(ADMIN_ID, "ADMIN", f"Metadata Sync: {count} updated")
+    await notify_admin(context, f"📊 **Silent Log**: Metadata Sync complete. `{count}` records updated.", silent=True)
 
 async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or codes_col is None: return
@@ -578,7 +626,10 @@ async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE)
             except: continue
         await status_msg.edit_text(f"✅ **Bulk Indexing Complete!** Indexed `{indexed_count}` items for `{prefix}`.")
         await log_event(ADMIN_ID, "ADMIN", f"Autobulk: {prefix} ({indexed_count} items)")
-    except Exception as e: await update.message.reply_text(f"❌ Error during autobulk: {e}")
+        await notify_admin(context, f"📦 **Silent Log**: Autobulk Success for `{prefix}` ({indexed_count} items).", silent=True)
+    except Exception as e: 
+        await update.message.reply_text(f"❌ Error during autobulk: {e}")
+        await notify_admin(context, f"🔴 **AUTOBULK FAILURE**: `{e}`")
 
 async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message or not context.args or codes_col is None: return
@@ -588,6 +639,7 @@ async def save_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = {"chat_id": update.effective_chat.id, "message_id": update.message.reply_to_message.message_id, "file_type": f_type, "file_id": f_id, "caption": caption or "", "file_name": f_name or ""}
     await codes_col.update_one({"code": code}, {"$set": data}, upsert=True)
     await update.message.reply_text(f"✅ Indexed `{code}` (Type: {f_type})")
+    await notify_admin(context, f"✅ **Silent Log**: Admin indexed `{code}`.", silent=True)
 
 async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or group_keys_col is None: return
@@ -596,6 +648,7 @@ async def set_group_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     password = context.args[1].strip()
     await group_keys_col.update_one({"chat_id": update.effective_chat.id, "prefix": prefix}, {"$set": {"secret_key": password}}, upsert=True)
     await update.message.reply_text(f"🔒 Key set for prefix `{prefix}` in this group!")
+    await notify_admin(context, f"🔒 **Silent Log**: Access key set for `{prefix}`.", silent=True)
 
 async def set_prefix_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID or prefix_labels_col is None: return
@@ -768,6 +821,7 @@ async def handle_reminder_callback(update: Update, context: ContextTypes.DEFAULT
         if reminders_col is not None:
             await reminders_col.delete_one({"_id": ObjectId(r_id)})
             await query.edit_message_text("❌ Reminder deleted.")
+            await notify_admin(context, f"🔔 **Silent Log**: User `{update.effective_user.id}` deleted a reminder.", silent=True)
     await query.answer()
 
 async def start_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -789,7 +843,6 @@ async def handle_tz_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_name = "🇺🇿 Tashkent/Uzbekistan"
     
     context.user_data['timezone'] = timezone_str
-    # Fix: Correctly clearing keyboard with a separate confirmation message
     await msg.reply_text(f"✅ Timezone: `{display_name}`", reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
     await msg.reply_text(f"📅 **Step 2: Target Date**\nSelect a date from the calendar:", reply_markup=create_calendar(), parse_mode="Markdown")
     return GET_DATE
@@ -851,17 +904,14 @@ async def handle_label_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await finish_reminder(update.message, context, update.effective_user.id)
 
 async def finish_reminder(message, context, user_id):
-    """Bulletproof reminder finalization with guaranteed state cleanup."""
     try:
         if reminders_col is None: return ConversationHandler.END
         user = user_id
         u_obj = await users_col.find_one({"user_id": user}) if users_col is not None else None
         username = u_obj.get("username") if u_obj else "Unknown"
         
-        # Verify required keys exist
         req = ['timezone', 'target_date', 'reminder_time', 'label']
         if not all(k in context.user_data for k in req):
-            logger.error(f"Missing context data: {context.user_data.keys()}")
             await message.reply_text("❌ Session error: Missing required information. Please try /remind again.")
             context.user_data.clear()
             return ConversationHandler.END
@@ -876,12 +926,10 @@ async def finish_reminder(message, context, user_id):
         res = await reminders_col.insert_one(data)
         data['_id'] = res.inserted_id
         
-        # Safe Job Scheduling
         if application: schedule_reminder_job(application, data)
         
-        success_text = f"🚀 **Reminder Armed!**\n\n🏷️ Label: `{data['label']}`\n📅 Date: `{data['target_date']}`\n⏰ Time: `{data['reminder_time']}` ({data['timezone']})\n\nI'll ping you daily until the day!"
+        success_text = f"🚀 **Reminder Armed!**\n\n🏷️ Label: `{data['label']}`\n📅 Date: `{data['target_date']}`\n⏰ Time: `{data['reminder_time']}`\n\nI'll ping you daily until the day!"
         
-        # Robust Message Delivery
         is_bot_msg = message.from_user.is_bot if message.from_user else False
         if is_bot_msg:
             try: await message.edit_text(success_text, parse_mode="Markdown")
@@ -890,6 +938,7 @@ async def finish_reminder(message, context, user_id):
             await message.reply_text(success_text, parse_mode="Markdown")
         
         await log_event(user, username, f"Set GUI Reminder: {data['label']}")
+        await notify_admin(context, f"📅 **Silent Log**: User `{user}` armed a reminder for `{data['label']}`.", silent=True)
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -897,6 +946,7 @@ async def finish_reminder(message, context, user_id):
         logger.error(f"CRITICAL FINISH ERROR: {e}", exc_info=True)
         try: await message.reply_text(f"❌ System Error: {e}")
         except: pass
+        await notify_admin(context, f"🔴 **FINISH FAILURE**: `{e}` for User `{user_id}`")
         context.user_data.clear()
         return ConversationHandler.END
 
@@ -914,8 +964,6 @@ async def browse_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_library_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     cat = query.data.split('_')[2] # series or movie
-    
-    # Analyze library using manual labels
     cursor = prefix_labels_col.find({"category": cat})
     prefixes = await cursor.to_list(length=None)
     
@@ -944,15 +992,13 @@ async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
         items = await cursor.to_list(length=None)
         keyboard = []
         for item in items:
-            # Show actual filename if available
             label = item.get("file_name") or item.get("caption", "").strip() or item["code"]
             if len(label) > 40: label = label[:37] + "..."
             keyboard.append([InlineKeyboardButton(f"🎬 {label}", callback_data=f"lib_dl_{item['code']}_one")])
         keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_movie")])
         await query.edit_message_text(f"🍿 **{name}**\n\nSelect a version to watch:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     else:
-        # Check for seasons
-        seasons = label_rec.get("seasons", [])
+        seasons = label_rec.get("seasons", []) if label_rec else []
         if seasons:
             keyboard = []
             for sn in seasons:
@@ -960,7 +1006,6 @@ async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
             keyboard.append([InlineKeyboardButton("Back", callback_data="lib_cat_series")])
             await query.edit_message_text(f"📺 **{name}**\n\nSelect a Season:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         else:
-            # Series grid (Standard)
             keyboard = []
             cursor = codes_col.find({"code": {"$regex": f"^{prefix}"}}).sort("code", 1)
             items = await cursor.to_list(length=None)
@@ -981,11 +1026,10 @@ async def handle_season_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     label_rec = await prefix_labels_col.find_one({"prefix": prefix})
     name = label_rec['name'] if label_rec else prefix
-    season_obj = next((s for s in label_rec['seasons'] if s['num'] == sn_num), None)
+    season_obj = next((s for s in label_rec['seasons'] if s['num'] == sn_num), None) if label_rec else None
     
     if not season_obj: return await query.answer("Season data error.")
     
-    # Filter episodes by range
     start, end = season_obj['start'], season_obj['end']
     target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
     cursor = codes_col.find({"code": {"$in": target_codes}}).sort("code", 1)
@@ -994,7 +1038,6 @@ async def handle_season_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard = []
     row = []
     for i, item in enumerate(items):
-        # Refined: Relative episode numbering (i + 1)
         row.append(InlineKeyboardButton(f"Ep {i+1}", callback_data=f"lib_dl_{item['code']}_one"))
         if len(row) == 4:
             keyboard.append(row)
@@ -1029,6 +1072,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id == ADMIN_ID:
         text, markup = await admin_palette_msg()
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        await notify_admin(context, f"👑 **Silent Log**: Master Console accessed.", silent=True)
     else:
         greet = "👋 **Welcome.**\n\n⏰ /remind - Set countdown (GUI)\n📜 /list - Manage reminders\n📦 /get - Open Content Library\n🎨 /ascii - ASCII art\n\nCopyright © **NurAziz**"
         await update.message.reply_text(greet, parse_mode="Markdown")
@@ -1115,6 +1159,7 @@ async def execute_file_delivery(chat_id, record, context, user, send_alert=True)
             else: msg = await context.bot.copy_message(chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
         else: msg = await context.bot.copy_message(chat_id, from_chat_id=record["chat_id"], message_id=record["message_id"])
         await log_event(user.id, user.username, f"Requested asset: {record['code']}")
+        await notify_admin(context, f"📦 **Silent Log**: User `{user.id}` fetched `{record['code']}`.", silent=True)
         if send_alert:
             warn = await context.bot.send_message(chat_id, "⚠️ **ALERT**: FILE IS EPHEMERAL\nSelf-destruct in 3 minutes.", parse_mode="Markdown")
             context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": msg.message_id})
@@ -1122,6 +1167,7 @@ async def execute_file_delivery(chat_id, record, context, user, send_alert=True)
         return msg
     except Exception as e:
         logger.error(f"Delivery Error: {e}")
+        await notify_admin(context, f"🔴 **DELIVERY FAILURE**: `{e}` for `{record.get('code')}`")
         return None
 
 async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1131,13 +1177,11 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
     is_admin = (user.id == ADMIN_ID)
     await save_user_info(user)
     
-    # EXCLUSIVE INLINE COMMAND LISTENER
     if text.upper().startswith("/GET "):
         parts = text.split()
         if len(parts) >= 2:
             return await get_file_command(update, context, force_args=parts[1:])
     
-    # Handle /ascii command if sent as a caption with an image or just text
     if text.lower().startswith("/ascii"):
         return await ascii_command_handler(update, context)
 
@@ -1171,6 +1215,7 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             m = await update.message.reply_text("❌ Key Denied.")
             context.job_queue.run_once(delete_msg_callback, 10, data={"chat_id": chat_id, "message_id": m.message_id})
+            await notify_admin(context, f"🛡️ **SECURITY ALERT**: Unauthorized key attempt on `{pending_prefix}` by User `{user.id}`.")
 
 async def inline_query_manager(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query.query.strip().upper()
@@ -1227,8 +1272,6 @@ def create_application():
         per_message=False
     )
     
-    man_conv = ConversationHandler(entry_points=[CallbackQueryHandler(manage_db_gui, pattern="^pal_manage$")], states={MANAGE_CHOOSE_PREFIX: [CallbackQueryHandler(handle_manage_callback, pattern="^pref_wipe_")]}, fallbacks=[CommandHandler("cancel", lambda u,c: (c.user_data.clear() or ConversationHandler.END))], per_message=False)
-    
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("admin", start_command))
     app.add_handler(CommandHandler("list", list_reminders))
@@ -1253,9 +1296,9 @@ def create_application():
     app.add_handler(CallbackQueryHandler(handle_library_pick, pattern="^lib_pick_"))
     app.add_handler(CallbackQueryHandler(handle_season_pick, pattern="^lib_sn_"))
     app.add_handler(CallbackQueryHandler(handle_library_delivery, pattern="^lib_dl_"))
+    app.add_handler(CallbackQueryHandler(manage_db_gui, pattern="^pal_manage$"))
+    app.add_handler(CallbackQueryHandler(handle_manage_callback, pattern="^pref_wipe_"))
     app.add_handler(rem_conv)
-    app.add_handler(man_conv)
-    # UNIVERSAL LISTENER
     app.add_handler(MessageHandler(filters.PHOTO | filters.TEXT, core_routing_manager))
     app.add_handler(InlineQueryHandler(inline_query_manager))
     return app
