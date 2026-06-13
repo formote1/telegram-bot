@@ -855,7 +855,7 @@ async def finish_reminder(message, context, user_id):
     try:
         if reminders_col is None: return ConversationHandler.END
         user = user_id
-        u_obj = await users_col.find_one({"user_id": user}) if users_col else None
+        u_obj = await users_col.find_one({"user_id": user}) if users_col is not None else None
         username = u_obj.get("username") if u_obj else "Unknown"
         
         # Verify required keys exist
