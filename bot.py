@@ -1107,7 +1107,7 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
                     if m: delivered_ids.append(m.message_id)
                     await asyncio.sleep(0.1)
                 if delivered_ids:
-                    warn = await context.bot.send_message(chat_id, "⚠️ EPHEMERAL: Wipe in 3m.", parse_mode="Markdown")
+                    warn = await context.bot.send_message(chat_id, "⚠️<u>File(s) are *EPHEMERAL*</u>⚠️\n\nFile will be deleted in 3 minutes due to copyright.\n\nPlease forward it to your *Saved Messages* to download", parse_mode="Markdown")
                     for m_id in delivered_ids: context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": m_id})
                     context.job_queue.run_once(delete_msg_callback, 180, data={"chat_id": chat_id, "message_id": warn.message_id})
         else:
