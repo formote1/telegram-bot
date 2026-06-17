@@ -92,7 +92,7 @@ MANAGE_CHOOSE_PREFIX = 4
 application = None
 main_loop = None
 
-# --- LOGGING & SENTINEL ---
+# --- LOGGING & SENTINEL (Absolute Safe) ---
 
 async def log_event(user_id, username, action):
     if logs_col is None: return
@@ -107,11 +107,10 @@ async def log_event(user_id, username, action):
         logger.error(f"Logging error: {e}")
 
 async def notify_admin(context, text, silent=False):
-    """Surgical notification system - Merged to logs per user request."""
-    # Absolute Safe Upgrade: Admin notifications are now purely internal logs.
+    """Surgical notification system - Merged to internal logs as requested."""
     await log_event(ADMIN_ID, "SENTINEL", text)
 
-# --- ASCII LOGIC (Text Only - Absolute Safe) ---
+# --- ASCII art LOGIC (Text Only - Absolute Safe) ---
 
 async def ascii_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Triggers the ASCII conversion for text ONLY."""
@@ -267,21 +266,34 @@ async def admin_palette_msg():
         [InlineKeyboardButton("🔄 Sync Metadata", callback_data="pal_sync")]
     ]
     text = (
-        "👑 **MASTER CONSOLE** (Alphabet GUI)\n"
+        "👑 **MASTER CONSOLE** (Ultimate Master)\n"
         "───────────────────────\n"
         "**System Status:** 🌐 Operational\n"
         "───────────────────────\n"
-        "📜 **COMMANDS LIST:**\n\n"
+        "📜 **COMPLETE COMMAND LIST:**\n\n"
+        "**Core Commands:**\n"
         "• `/start` / `/admin` - Dashboard\n"
-        "• `/remind` - Setup countdown\n"
+        "• `/remind` - Setup countdown (GUI)\n"
         "• `/list` - View reminders\n"
         "• `/ascii` - Text to ASCII art\n\n"
+        "**Database Matrix:**\n"
         "• `/save CODE` - Index by reply\n"
         "• `/autobulk START END PREFIX` - Mass index\n"
-        "• `/del CODE` / `/del PREFIX START END` - Wipe\n"
-        "• `/setkey PREFIX PASSWORD` - Lock\n"
-        "• `/setlabel` / `/setseason` - Organize\n"
-        "• `/refresh` - Sync Metadata\n\n"
+        "• `/del CODE` - Single file delete\n"
+        "• `/del PREFIX START END` - Surgical range delete\n"
+        "• `/setkey PREFIX PASSWORD` - Secure prefix partition\n"
+        "• `/setlabel PREFIX CAT TITLE` - Assign title & category\n"
+        "• `/setseason PREFIX SN START END` - Map season range\n"
+        "• `/delseason PREFIX SN` - Delete specific season\n"
+        "• `/clearseasons PREFIX` - Wipe all seasons\n"
+        "• `/rename_prefix OLD NEW` - Bulk migrate prefix\n"
+        "• `/refresh` - Sync missing metadata\n\n"
+        "**File Retrieval Engine:**\n"
+        "• `/get CODE` - Fetch specific asset\n"
+        "• `/get PREFIX START END` - Sequential range delivery\n\n"
+        "**Monitoring:**\n"
+        "• `/stats` - Live system audit report\n"
+        "• `/export` - Database JSON backup\n"
         "───────────────────────"
     )
     return text, InlineKeyboardMarkup(keyboard)
@@ -291,7 +303,7 @@ async def handle_palette_callback(update: Update, context: ContextTypes.DEFAULT_
     if update.effective_user.id != ADMIN_ID:
         return await query.answer("Access Denied.", show_alert=True)
         
-    action = query.data.split('_')[1]
+    action = query.data.split('_')[ActionIndex := 1]
     if action == "stats": await get_stats(update, context)
     elif action == "users": await get_user_directory(update, context) 
     elif action == "export": await export_data(update, context)
@@ -320,7 +332,8 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔐 **Locked Prefixes:** `{k_c:03d}`\n"
         f"📋 **Stored Logs:** `{l_c:03d}`\n"
         f"👤 **Unique Users:** `{u_c:03d}`\n"
-        "───────────────────"
+        "───────────────────\n"
+        "*Auto-cleaning active: Logs purge every 7 days.*"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("👤 View User Directory", callback_data="pal_users")]])
     await update.effective_message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
@@ -524,9 +537,9 @@ async def refresh_metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if f_id:
                 await codes_col.update_one({"_id": record["_id"]}, {"$set": {"file_type": f_type, "file_id": f_id, "caption": caption or "", "file_name": f_name or ""}})
                 count += 1
-            if (count % 10 == 0) or count == total_to_sync:
+            if (count % 5 == 0) or count == total_to_sync:
                 await status_msg.edit_text(f"🔄 **Syncing Metadata...**\nProgress: `{count}/{total_to_sync}` updated.", parse_mode="Markdown")
-            await asyncio.sleep(0.3) 
+            await asyncio.sleep(0.5) 
         except Exception as e:
             logger.warning(f"Metadata fetch failed for {record.get('code')}: {e}")
             continue
@@ -553,7 +566,6 @@ async def auto_bulk_register(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await codes_col.update_one({"code": code_to_save}, {"$set": {"chat_id": update.effective_chat.id, "message_id": m_id, "file_type": f_type, "file_id": f_id, "caption": caption or "", "file_name": f_name or ""}}, upsert=True)
                     indexed_count += 1
                     curr += 1
-                await asyncio.sleep(0.2)
             except: continue
         await status_msg.edit_text(f"✅ **Bulk Indexing Complete!** Indexed `{indexed_count}` items for `{prefix}`.")
         await log_event(ADMIN_ID, "ADMIN", f"Autobulk: {prefix} ({indexed_count} items)")
@@ -861,10 +873,8 @@ async def browse_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else: await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_alphabet_selector(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Emerges after selecting category: shows A-Z grid."""
     query = update.callback_query
-    cat = query.data.split('_')[2] # series or movie
-    
+    cat = query.data.split('_')[2]
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ#"
     keyboard = []
     row = []
@@ -875,30 +885,18 @@ async def show_alphabet_selector(update: Update, context: ContextTypes.DEFAULT_T
             row = []
     if row: keyboard.append(row)
     keyboard.append([InlineKeyboardButton("🔙 Back to Categories", callback_data="lib_back")])
-    
     await query.edit_message_text(f"📂 **{cat.upper()} - Select Letter**\nChoose starting letter:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def show_filtered_library_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Automatically assigns titles based on first letter."""
     query = update.callback_query
     parts = query.data.split('_')
     cat, letter = parts[2], parts[3]
-    
-    # regex for alphabet vs non-alphabet
     regex = f"^{letter}" if letter != "#" else "^[^A-Za-z]"
-    cursor = prefix_labels_col.find({
-        "category": cat,
-        "name": {"$regex": regex, "$options": "i"}
-    }).sort("name", 1)
-    
+    cursor = prefix_labels_col.find({"category": cat, "name": {"$regex": regex, "$options": "i"}}).sort("name", 1)
     prefixes = await cursor.to_list(length=None)
-    
-    if not prefixes:
-        return await query.answer(f"No {cat} starting with '{letter}'.", show_alert=True)
-    
+    if not prefixes: return await query.answer(f"No {cat} starting with '{letter}'.", show_alert=True)
     keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"lib_pick_{cat}_{p['prefix']}")] for p in prefixes]
     keyboard.append([InlineKeyboardButton("🔙 Back to Alphabet", callback_data=f"lib_cat_{cat}")])
-    
     await query.edit_message_text(f"📂 **{cat.upper()} ({letter})**\nSelect a title:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -907,10 +905,7 @@ async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE
     cat, prefix = parts[2], parts[3]
     label_rec = await prefix_labels_col.find_one({"prefix": prefix})
     name = label_rec['name'] if label_rec else prefix
-    
-    # Find first letter for 'Back' button persistence
     first_letter = name[0].upper() if name and name[0].isalpha() else "#"
-    
     if cat == "movie":
         cursor = codes_col.find({"code": {"$regex": f"^{prefix}"}}).sort("code", 1)
         items = await cursor.to_list(length=None)
@@ -945,14 +940,11 @@ async def handle_season_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     label_rec = await prefix_labels_col.find_one({"prefix": prefix})
     name = label_rec['name'] if label_rec else prefix
     season_obj = next((s for s in label_rec['seasons'] if s['num'] == sn_num), None) if label_rec else None
-    
     if not season_obj: return await query.answer("Error.")
-    
     start, end = season_obj['start'], season_obj['end']
     target_codes = [f"{prefix}{i:03d}" for i in range(start, end + 1)]
     cursor = codes_col.find({"code": {"$in": target_codes}}).sort("code", 1)
     items = await cursor.to_list(length=None)
-    
     keyboard, row = [], []
     for i, item in enumerate(items):
         row.append(InlineKeyboardButton(f"Ep {i+1}", callback_data=f"lib_dl_{item['code']}_one"))
@@ -967,7 +959,6 @@ async def handle_library_delivery(update: Update, context: ContextTypes.DEFAULT_
     target, mode = parts[2], parts[3]
     user = update.effective_user
     chat_id = update.effective_chat.id
-    
     if mode == "all":
         cursor = codes_col.find({"code": {"$regex": f"^{target}"}}).sort("code", 1)
         records = await cursor.to_list(length=None)
@@ -993,9 +984,7 @@ async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     if codes_col is None: return
     args = force_args if force_args is not None else context.args
     chat_id = update.effective_chat.id
-    
     if not args: return await browse_library(update, context)
-        
     user = update.effective_user
     is_admin = (user.id == ADMIN_ID)
     if len(args) == 1:
@@ -1078,13 +1067,10 @@ async def core_routing_manager(update: Update, context: ContextTypes.DEFAULT_TYP
     if not update.message or not update.message.text or codes_col is None: return
     user, chat_id, text = update.effective_user, update.effective_chat.id, update.message.text.strip()
     is_admin = (user.id == ADMIN_ID)
-    
     if text.upper().startswith("/GET "):
         parts = text.split()
         if len(parts) >= 2: return await get_file_command(update, context, force_args=parts[1:])
-    
     if text.lower().startswith("/ascii"): return await ascii_command_handler(update, context)
-
     pending_chat = context.user_data.get('pending_unlock_group_id')
     pending_prefix = context.user_data.get('pending_unlock_prefix')
     if pending_chat and pending_prefix and not is_admin:
@@ -1138,7 +1124,16 @@ async def inline_query_manager(update: Update, context: ContextTypes.DEFAULT_TYP
             elif f_type == "document": results.append(InlineQueryResultCachedDocument(id=uid, document_file_id=f_id, title=f"📦 {code}", caption=caption))
             elif f_type == "photo": results.append(InlineQueryResultCachedPhoto(id=uid, photo_file_id=f_id, caption=caption))
             elif f_type == "audio": results.append(InlineQueryResultCachedAudio(id=uid, audio_file_id=f_id, title=f"📦 {code}", caption=caption))
+            elif f_type == "voice": results.append(InlineQueryResultCachedVoice(id=uid, voice_file_id=f_id, title=f"📦 {code}", caption=caption))
+            elif f_type == "animation": results.append(InlineQueryResultCachedMpeg4Gif(id=uid, mpeg4_file_id=f_id, title=f"📦 {code}", caption=caption))
         if not results: results.append(InlineQueryResultArticle(id=uid, title=f"📦 {code}", input_message_content=InputTextMessageContent(f"/get {code}")))
+    elif len(parts) == 4:
+        prefix, start, end = parts[1], parts[2], parts[3]
+        try:
+            s_num, e_num = int(start), int(end)
+            count = e_num - s_num + 1
+            if count > 0: results.append(InlineQueryResultArticle(id=str(uuid.uuid4()), title=f"📦 Batch: {count} files", input_message_content=InputTextMessageContent(f"/get {prefix} {start} {end}")))
+        except: pass
     await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
 # --- APP SETUP ---
@@ -1189,7 +1184,7 @@ def create_application():
 
 flask_app = Flask(__name__)
 @flask_app.route('/')
-def health(): return "Alphabet GUI Bot Online."
+def health(): return "Ultimate Master Bot Online."
 @flask_app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
     if main_loop:
