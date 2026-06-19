@@ -137,25 +137,10 @@ async def ascii_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
         ascii_result = f.renderText(text_content)
 
         if ascii_result:
-#            with open(filename, "w") as f:
-#                f.write(ascii_result)
-#            
-#            try:
-#                with open(filename, "rb") as f:
-#                    await message.reply_document(
-#                        document=f,
-#                        filename="ascii_art.txt",
-#                        caption="For better visuals open the file on desktop/laptop"
-#                    )
-#            finally:
-#               if os.path.exists(filename): 
-#                    try: os.remove(filename)
-#                    except: pass
-            
             # Create an in-memory file-like stream from the text string
             file_strean = io.BytesIO(ascii_result.encode('utf-8'))
             await message.reply_document(
-                document=file_stream
+                document=file_stream,
                 filename="ascii_art.txt",
                 caption="For better visuals open the file on desktop/laptop"
             )
