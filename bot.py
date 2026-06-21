@@ -896,7 +896,7 @@ async def show_filtered_library_items(update: Update, context: ContextTypes.DEFA
     if not prefixes: return await query.answer(f"No {cat} starting with '{letter}'.", show_alert=True)
     keyboard = [[InlineKeyboardButton(p['name'], callback_data=f"lib_pick_{cat}_{p['prefix']}")] for p in prefixes]
     keyboard.append([InlineKeyboardButton("🔙 Back to Alphabet", callback_data=f"lib_cat_{cat}")])
-    await query.edit_message_text(f"📂 **{cat.upper()} ({letter})**\nSelect a title:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await query.edit_message_text(f"📂 **{cat.upper()} ({letter})**\nSelect a title:ㅤㅤㅤㅤ", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 async def handle_library_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
